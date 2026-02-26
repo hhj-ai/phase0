@@ -25,7 +25,6 @@ pycocotools==2.0.8
 gdown==5.2.0
 matplotlib==3.10.0
 typing-extensions==4.12.2
-fsspec==2024.12.0
 filelock==3.16.1
 pyyaml==6.0.2
 requests==2.32.3
@@ -82,7 +81,7 @@ else
 fi
 
 echo "安装依赖包到构建环境（用于下载模型）..."
-pip install --no-cache-dir -r $SHARED/code/requirements_official.txt
+pip install --no-cache-dir --index-url https://pypi.org/simple --trusted-host pypi.org --trusted-host files.pythonhosted.org -r $SHARED/code/requirements_official.txt
 
 echo "下载Qwen3-VL-8B-Instruct模型（bf16全精度）..."
 python -c "
