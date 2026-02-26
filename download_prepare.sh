@@ -65,6 +65,10 @@ python -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
 
 echo "构建transformers主分支wheel（Qwen3-VL必需）..."
 if [ ! -f $WHEELS/transformers*.whl ]; then
+    if [ -d "$SHARED/code/transformers" ]; then
+        echo "检测到已存在的transformers目录，删除..."
+        rm -rf $SHARED/code/transformers
+    fi
     git clone --depth 1 https://github.com/huggingface/transformers.git $SHARED/code/transformers
     cd $SHARED/code/transformers && python -m pip wheel . -w $WHEELS --no-deps
     cd $SHARED/code
