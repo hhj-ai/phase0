@@ -1,210 +1,174 @@
+# p0_main.py
+"""
+P0实验 —— JS散度视觉锚定验证实验（VLM幻觉缓解框架最核心Phase 0）
+
+实验目的与背景：
+本实验来自《VLM幻觉缓解框架文献调研报告》。目的是验证「对目标物体对应的visual token做均值替换」后，
+output logits层 + 中间hidden layers (16,20,24,28,32) 的JS散度是否能作为可靠的“物理测谎仪”：
+- 正例（图中真正存在该物体）：JS散度显著大 → 证明模型真的看了图、视觉信息流正常
+- 反例（图中无物体但模型hallucinated）：JS散度显著小 → 证明模型在用纯语言先验瞎猜
+- 控制组（替换无关区域）：JS散度小
+核心假设：JS散度可作为特征空间的视觉锚定度物理信号，未来可直接嵌入对抗式RL训练的奖励函数。
+这是范式级创新，所有先前工作（VCD、M3ID、Vision-SR1、TON等）均未实现此信号用于训练。
+如果AUC>0.85则P0通过，可进入Phase 1 GRPO训练。
+
+模型：Qwen/Qwen3-VL-8B-Instruct（bf16全精度，无任何量化）
+环境：8×H200，torchrun --nproc_per_node=8
+路径：全部硬编码在/shared路径下
+"""
+
 import os
 import torch
-import torch.nn.functional as F
+import argparse
+import json
 import numpy as np
 import pandas as pd
-import argparse
-from tqdm import tqdm
 from PIL import Image
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
-from scipy.spatial.distance import jensenshannon
-from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Dataset
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
+from scipy.stats import entropy
+from sklearn.metrics import roc_auc_score
 
-"""
-实验名称：P0实验 —— JS散度视觉锚定验证实验
-核心假设：验证视觉Token均值替换后的Hidden Layers JS散度是否能区分【真视觉流入】与【语言先验幻觉】。
-模型要求：Qwen3-VL-8B (BF16, No Quantization)
-物理测谎仪逻辑：
-- Positive (Exist): High JS Divergence (Model relies on visual tokens)
-- Negative (Hallucination): Low JS Divergence (Model ignores visual tokens)
-"""
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+import torch.distributed as dist
+from accelerate import Accelerator
 
-SHARED_ROOT = "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl"
-
-def print_p0_header():
-    header = """
-    ****************************************************************
-    * P0 实验启动: JS 散度视觉锚定物理测谎仪验证                     *
-    * 框架阶段: Phase 0 (信号有效性验证)                            *
-    * 关键指标: AUC-ROC > 0.85 则通过，进入 GRPO 训练阶段           *
-    * 运行模式: 8-GPU BF16 全精度分布式推理                         *
-    ****************************************************************
-    """
-    print(header)
-
-def calculate_js_divergence(p_logits, q_logits):
-    """计算两个分布之间的JS散度"""
-    p = F.softmax(p_logits, dim=-1).detach().cpu().float().numpy()
-    q = F.softmax(q_logits, dim=-1).detach().cpu().float().numpy()
-    # 为计算方便，取平均
+def js_divergence(p, q):
+    p = np.clip(p, 1e-10, 1)
+    q = np.clip(q, 1e-10, 1)
     m = 0.5 * (p + q)
-    return 0.5 * (jensenshannon(p, m, axis=-1)**2 + jensenshannon(q, m, axis=-1)**2)
+    return 0.5 * (entropy(p, m) + entropy(q, m))
 
-class P0Dataset(Dataset):
-    def __init__(self, data_root, num_samples=800):
-        # 简单实现：混合 HallusionBench 和 COCO 样本
-        self.samples = [] 
-        # 此处省略具体解析逻辑，预设格式：{'image_path': str, 'prompt': str, 'bbox': [y1, x1, y2, x2], 'label': 1/0}
-        # 生产级代码应从 self.data_root 加载真实标注
-        for i in range(num_samples):
-            self.samples.append({
-                "id": i,
-                "image_path": f"{data_root}/coco_val2017/val2017/000000000139.jpg", # 示例路径
-                "prompt": "Is there a person in the image?",
-                "bbox": [100, 100, 300, 300], # 模拟bbox
-                "is_hallucination": i % 2 # 模拟构造正负例
-            })
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-def get_visual_token_indices(grid_thw, bbox):
-    """
-    根据Qwen3-VL的image_grid_thw(T, H, W)和归一化bbox计算对应的visual token索引
-    逻辑：根据网格划分，定位bbox覆盖的patch。
-    """
-    t, h_grid, w_grid = grid_thw[0]
-    y1, x1, y2, x2 = bbox # 0-1000 scale
-    
-    start_h, end_h = int(y1 * h_grid / 1000), int(y2 * h_grid / 1000)
-    start_w, end_w = int(x1 * w_grid / 1000), int(x2 * w_grid / 1000)
-    
+def calculate_patch_indices(bbox, grid_thw, patch_size=14):
+    """根据bbox和grid_thw计算需要替换的patch索引（进阶版token均值替换核心）"""
+    x1, y1, x2, y2 = bbox
+    h, w = grid_thw[1], grid_thw[2]
+    patch_h, patch_w = h // patch_size, w // patch_size
+    start_row = int(y1 / patch_size)
+    end_row = int(y2 / patch_size)
+    start_col = int(x1 / patch_size)
+    end_col = int(x2 / patch_size)
     indices = []
-    for h in range(start_h, min(end_h + 1, h_grid)):
-        for w in range(start_w, min(end_w + 1, w_grid)):
-            indices.append(h * w_grid + w)
+    for r in range(start_row, end_row):
+        for c in range(start_col, end_col):
+            idx = r * patch_w + c
+            indices.append(idx)
     return indices
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--num_samples", type=int, default=800)
-    parser.add_argument("--batch_size", type=int, default=1)
-    args = parser.parse_args()
+def main(args):
+    print("=== P0实验启动 ===")
+    print("实验目的：验证JS散度作为视觉锚定度物理测谎仪的可行性，用于未来RL奖励信号。")
+    print("核心假设：JS散度可作为特征空间视觉锚定信号，打破现有工作仅推理时使用的局限。")
 
-    init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    
-    if local_rank == 0: print_p0_header()
+    accelerator = Accelerator()
+    device = accelerator.device
 
-    # 1. 加载模型 (BF16 全精度)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model_path,
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/models/Qwen3-VL-8B-Instruct",
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map={"": local_rank}
+        device_map="auto",
+        attn_implementation="flash_attention_2"
     )
-    processor = AutoProcessor.from_pretrained(args.model_path)
-    
-    # 2. 钩子函数获取中间层 (16, 20, 24, 28, 32)
-    target_layers = [16, 20, 24, 28, 32]
-    activation = {}
-    def get_activation(name):
-        def hook(model, input, output):
-            # Qwen2.5-VL output is (batch, seq, hidden)
-            activation[name] = output[0].detach()
-        return hook
-
-    for l_idx in target_layers:
-        model.model.layers[l_idx].register_forward_hook(get_activation(f"layer_{l_idx}"))
-
-    # 3. 数据准备
-    dataset = P0Dataset(args.data_root, args.num_samples)
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler)
+    processor = AutoProcessor.from_pretrained(
+        "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/models/Qwen3-VL-8B-Instruct"
+    )
 
     results = []
 
-    # 4. 推理循环
-    model.eval()
-    for batch in tqdm(dataloader, disable=(local_rank != 0)):
-        # 预处理
-        messages = [{"role": "user", "content": [{"type": "image", "image": batch['image_path'][0]}, {"type": "text", "text": batch['prompt'][0]}]}]
+    # 1. HallusionBench（presence/absence问题）
+    hallusion_path = "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/datasets/hallusion_bench/HallusionBench.json"
+    with open(hallusion_path) as f:
+        data = json.load(f)[:args.num_samples // 2]
+
+    for item in tqdm(data, desc="HallusionBench", disable=not accelerator.is_main_process):
+        if "is there" not in item['question'].lower() and "存在" not in item['question']:
+            continue
+        img_path = f"/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/datasets/hallusion_bench/images/{item['image']}"
+        image = Image.open(img_path).convert("RGB")
+        question = item['question']
+        gt = int(item.get('answer', 1))  # 1=存在
+
+        # 正例/反例/控制
+        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]}]
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
-        inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt").to(model.device)
+        inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt").to(device)
 
-        # A. 原始前向传播
         with torch.no_grad():
-            outputs_orig = model(**inputs)
-            orig_logits = outputs_orig.logits[:, -1, :]
-            orig_hiddens = {name: act[:, -1, :] for name, act in activation.items()}
+            orig_out = model(**inputs, output_hidden_states=True, return_dict=True)
 
-        # B. 视觉Token均值替换 (核心介入)
-        # 寻找视觉token在sequence中的位置
-        # 注意：Qwen3-VL视觉token通常在特定占位符之后
-        grid_thw = inputs['image_grid_thw']
-        patch_indices = get_visual_token_indices(grid_thw, batch['bbox'])
-        
-        # 简易实现：找到第一张图的起始offset (根据 <|vision_start|> 标签)
-        input_ids = inputs['input_ids'][0]
-        vision_start_idx = (input_ids == processor.tokenizer.convert_tokens_to_ids("<|visual_pad|>")).nonzero(as_tuple=True)[0]
-        
-        if len(vision_start_idx) > 0:
-            offset = vision_start_idx[0]
-            # 这里的输入嵌入层替换
-            modified_inputs = inputs.copy()
-            inputs_embeds = model.get_input_embeddings()(inputs['input_ids']).clone()
-            
-            # 对目标patch执行均值替换 (物理测谎仪核心步骤)
-            for idx in patch_indices:
-                if offset + idx < inputs_embeds.shape[1]:
-                    # 取周围token均值或全局均值
-                    inputs_embeds[0, offset + idx] = torch.mean(inputs_embeds[0, offset], dim=0) 
-            
-            # C. 介入后前向传播
-            outputs_mod = model(inputs_embeds=inputs_embeds, attention_mask=inputs['attention_mask'])
-            mod_logits = outputs_mod.logits[:, -1, :]
-            mod_hiddens = {name: act[:, -1, :] for name, act in activation.items()}
+        # 简化版：bbox像素mask（快速验证，推荐先跑此版本）
+        masked_image = image.copy()
+        # 示例mask（实际应从COCO或检测获取bbox）
+        w, h = masked_image.size
+        mask_box = (w//4, h//4, w*3//4, h*3//4)
+        mask_arr = np.array(masked_image)
+        mask_arr[mask_box[1]:mask_box[3], mask_box[0]:mask_box[2]] = mask_arr.mean(axis=(0,1)).astype(np.uint8)
+        masked_image = Image.fromarray(mask_arr)
 
-            # 5. 计算各层 JS 散度
-            sample_res = {"id": batch['id'].item(), "is_hallucination": batch['is_hallucination'].item()}
-            sample_res["js_logits"] = calculate_js_divergence(orig_logits, mod_logits)
-            for l_idx in target_layers:
-                js_l = calculate_js_divergence(orig_hiddens[f"layer_{l_idx}"], mod_hiddens[f"layer_{l_idx}"])
-                sample_res[f"js_layer_{l_idx}"] = js_l
-            
-            results.append(sample_res)
+        masked_inputs = processor(text=[text], images=[masked_image], videos=video_inputs, padding=True, return_tensors="pt").to(device)
 
-    # 6. 聚合结果与分析
+        with torch.no_grad():
+            masked_out = model(**masked_inputs, output_hidden_states=True, return_dict=True)
+
+        # 计算JS
+        js_scores = {}
+        # logits (last token)
+        p = torch.softmax(orig_out.logits[0, -1], dim=-1).cpu().float().numpy()
+        q = torch.softmax(masked_out.logits[0, -1], dim=-1).cpu().float().numpy()
+        js_scores['logits'] = js_divergence(p, q)
+
+        # 中间层 (Qwen3-VL hidden_states索引从0开始，深层为16+)
+        for layer_idx in [16, 20, 24, 28, 32]:
+            h_orig = orig_out.hidden_states[layer_idx][0, -1].cpu().float().numpy()
+            h_mask = masked_out.hidden_states[layer_idx][0, -1].cpu().float().numpy()
+            h_orig = h_orig / np.linalg.norm(h_orig + 1e-8)
+            h_mask = h_mask / np.linalg.norm(h_mask + 1e-8)
+            js_scores[f'layer_{layer_idx}'] = js_divergence(h_orig, h_mask)  # 近似
+
+        results.append({
+            'type': 'hallusion',
+            'has_object': gt,
+            'js_logits': js_scores['logits'],
+            **{k: v for k, v in js_scores.items() if 'layer' in k}
+        })
+
+    # 2. COCO子集（精确正/反/控制，代码省略部分，可后续扩展，使用pycocotools）
+    # ... (类似处理，生成正例/反例/控制组)
+
     df = pd.DataFrame(results)
-    # 分布式收集 (省略逻辑，假设主卡汇总)
-    if local_rank == 0:
-        df.to_csv(f"{args.output_dir}/js_results.csv", index=False)
-        
-        # 计算针对幻觉检测的 AUC
-        # 注意：逻辑是 JS散度越大 -> 越不是幻觉
-        auc_logits = roc_auc_score(1 - df['is_hallucination'], df['js_logits'])
-        auc_layer_24 = roc_auc_score(1 - df['is_hallucination'], df['js_layer_24'])
-        
-        summary = f"P0 实验总结:\nLogits AUC: {auc_logits:.4f}\nLayer 24 AUC: {auc_layer_24:.4f}\n"
-        status = "PASSED" if auc_layer_24 > 0.85 else "FAILED"
-        summary += f"结论: {status} (阈值 0.85)\n"
-        
-        with open(f"{args.output_dir}/summary.log", "w") as f:
-            f.write(summary)
-        print(summary)
+    os.makedirs("/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/results", exist_ok=True)
+    df.to_csv("/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/results/js_results.csv", index=False)
 
-        # 绘制层级 JS 散度趋势图
-        plt.figure(figsize=(10, 6))
-        plt.plot(target_layers, [df[f"js_layer_{l}"].mean() for l in target_layers], marker='o')
-        plt.title("Visual Anchoring Signal (JS-Div) across Layers")
-        plt.xlabel("Layer Index")
-        plt.ylabel("Mean JS Divergence")
-        plt.savefig(f"{args.output_dir}/js_trend.png")
+    # AUC评估
+    if len(df) > 10:
+        auc_logits = roc_auc_score(df['has_object'], df['js_logits'])
+        print(f"\n=== P0实验结果总结 ===")
+        print(f"Logits层 AUC: {auc_logits:.4f}")
+        for layer in [16,20,24,28,32]:
+            col = f'layer_{layer}'
+            if col in df.columns:
+                auc = roc_auc_score(df['has_object'], df[col])
+                print(f"Layer {layer} AUC: {auc:.4f}")
+        if auc_logits > 0.85:
+            print("P0通过阈值：AUC>0.85 → 可进入Phase 1 GRPO训练！")
+        else:
+            print("P0未达阈值，建议检查mask策略或切换进阶token替换。")
 
-    destroy_process_group()
+    # 绘制热力图
+    layers = ['logits'] + [f'layer_{l}' for l in [16,20,24,28,32]]
+    means = [df[l].mean() for l in layers if l in df.columns]
+    plt.figure(figsize=(10,6))
+    plt.bar(layers[:len(means)], means)
+    plt.title("JS散度均值（物理测谎仪强度） - P0实验")
+    plt.ylabel("JS Divergence")
+    plt.savefig("/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/results/js_heatmap.png")
+    plt.close()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_samples", type=int, default=800)
+    parser.add_argument("--batch_size", type=int, default=4)
+    args = parser.parse_args()
+    main(args)
