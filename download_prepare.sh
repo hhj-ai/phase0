@@ -24,6 +24,11 @@ datasets==3.2.0
 pycocotools==2.0.8
 gdown==5.2.0
 matplotlib==3.10.0
+typing-extensions==4.12.2
+fsspec==2024.12.0
+filelock==3.16.1
+pyyaml==6.0.2
+requests==2.32.3
 EOF
 
 echo "下载 Python 3.10.13 预编译版本..."
@@ -50,7 +55,7 @@ for pkg in $(cat $SHARED/code/requirements_official.txt); do
         echo "✅ 已存在，跳过: $pkg"
     else
         echo "下载: $pkg"
-        python -m pip download "$pkg" --no-deps \
+        python -m pip download "$pkg" \
           --index-url https://pypi.org/simple \
           --trusted-host pypi.org \
           --trusted-host files.pythonhosted.org \
@@ -61,7 +66,7 @@ done
 echo "下载torch家族（cu124，兼容Python 3.10）..."
 python -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
   --index-url https://download.pytorch.org/whl/cu124 \
-  --no-deps --no-cache-dir -d $WHEELS
+  --no-cache-dir -d $WHEELS
 
 echo "构建transformers主分支wheel（Qwen3-VL必需）..."
 if [ ! -f $WHEELS/transformers*.whl ]; then
@@ -76,8 +81,8 @@ else
     echo "✅ transformers wheel 已存在，跳过"
 fi
 
-echo "安装huggingface_hub用于下载模型..."
-pip install --no-index --no-cache-dir --find-links=$WHEELS huggingface_hub
+echo "安装依赖包到构建环境（用于下载模型）..."
+pip install --no-cache-dir -r $SHARED/code/requirements_official.txt
 
 echo "下载Qwen3-VL-8B-Instruct模型（bf16全精度）..."
 python -c "
