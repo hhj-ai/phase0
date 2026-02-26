@@ -35,7 +35,7 @@ for pkg in $(cat $SHARED/code/requirements_official.txt); do
         echo "✅ 已存在，跳过: $pkg"
     else
         echo "下载: $pkg"
-        python3.11 -m pip download "$pkg" --no-deps \
+        python -m pip download "$pkg" --no-deps \
           --index-url https://pypi.org/simple \
           --trusted-host pypi.org \
           --trusted-host files.pythonhosted.org \
@@ -44,21 +44,21 @@ for pkg in $(cat $SHARED/code/requirements_official.txt); do
 done
 
 echo "下载torch家族（cu124）..."
-python3.11 -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
+python -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
   --index-url https://download.pytorch.org/whl/cu124 \
   --no-deps --no-cache-dir -d $WHEELS
 
 echo "构建transformers主分支wheel..."
 if [ ! -f $WHEELS/transformers*.whl ]; then
     git clone --depth 1 https://github.com/huggingface/transformers.git $SHARED/code/transformers
-    cd $SHARED/code/transformers && python3.11 -m pip wheel . -w $WHEELS --no-deps
+    cd $SHARED/code/transformers && python -m pip wheel . -w $WHEELS --no-deps
     cd $SHARED/code
 else
     echo "✅ transformers wheel 已存在，跳过"
 fi
 
 echo "下载Qwen3-VL-8B-Instruct模型（bf16全精度）..."
-python3.11 -c "
+python -c "
 from huggingface_hub import snapshot_download
 snapshot_download(repo_id='Qwen/Qwen3-VL-8B-Instruct',
                   local_dir='$SHARED/data/models/Qwen3-VL-8B-Instruct',

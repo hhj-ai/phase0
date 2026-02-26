@@ -51,7 +51,7 @@ def main(args):
         "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/models/Qwen3-VL-8B-Instruct",
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="sdpa"   # 使用内置sdpa，彻底解决flash-attn兼容问题
+        attn_implementation="sdpa"
     )
     processor = AutoProcessor.from_pretrained(
         "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/models/Qwen3-VL-8B-Instruct"
