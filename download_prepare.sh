@@ -28,6 +28,9 @@ typing-extensions==4.12.2
 filelock==3.16.1
 pyyaml==6.0.2
 requests==2.32.3
+jinja2==3.1.4
+networkx==3.4.2
+sympy==1.13.3
 EOF
 
 echo "下载 Python 3.10.13 预编译版本..."
@@ -65,7 +68,7 @@ done
 echo "下载torch家族（cu124，兼容Python 3.10）..."
 python -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
   --index-url https://download.pytorch.org/whl/cu124 \
-  --no-cache-dir -d $WHEELS
+  --no-deps --no-cache-dir -d $WHEELS
 
 echo "构建transformers主分支wheel（Qwen3-VL必需）..."
 if [ ! -f $WHEELS/transformers*.whl ]; then
