@@ -11,23 +11,22 @@ mkdir -p $SHARED/{code,data/models/Qwen3-VL-8B-Instruct,data/datasets/hallusion_
 cd $SHARED/code
 
 cat > requirements_official.txt << EOF
-accelerate==0.34.2
-qwen-vl-utils==0.0.14
-flash-attn==2.6.3
-huggingface_hub==0.28.1
-pillow==11.1.0
-numpy==1.26.4
-scipy==1.13.1
-pandas==2.2.3
-tqdm==4.67.1
-scikit-learn==1.5.2
-datasets==3.1.0
+accelerate==0.33.0
+qwen-vl-utils==0.0.8
+huggingface_hub==0.25.2
+pillow==10.4.0
+numpy==1.24.4
+scipy==1.10.1
+pandas==2.0.3
+tqdm==4.66.5
+scikit-learn==1.3.2
+datasets==2.19.2
 pycocotools==2.0.8
 gdown==5.2.0
-matplotlib==3.9.4
+matplotlib==3.7.5
 EOF
 
-echo "强制使用官方PyPI + 跳过已下载包..."
+echo "强制使用官方PyPI + 跳过已下载包（全部Python 3.8兼容版）..."
 cd $WHEELS
 for pkg in $(cat $SHARED/code/requirements_official.txt); do
     pkg_name=$(echo $pkg | cut -d= -f1 | sed 's/==.*//')
@@ -43,12 +42,12 @@ for pkg in $(cat $SHARED/code/requirements_official.txt); do
     fi
 done
 
-echo "下载torch家族（cu124）..."
+echo "下载torch家族（cu124，兼容Python 3.8）..."
 python -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
   --index-url https://download.pytorch.org/whl/cu124 \
   --no-deps --no-cache-dir -d $WHEELS
 
-echo "构建transformers主分支wheel..."
+echo "构建transformers主分支wheel（Qwen3-VL必需）..."
 if [ ! -f $WHEELS/transformers*.whl ]; then
     git clone --depth 1 https://github.com/huggingface/transformers.git $SHARED/code/transformers
     cd $SHARED/code/transformers && python -m pip wheel . -w $WHEELS --no-deps
