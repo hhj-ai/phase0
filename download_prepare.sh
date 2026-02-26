@@ -31,8 +31,7 @@ if [ ! -d "$SHARED/tools/python3.10" ]; then
     cd $SHARED/tools
     wget -q https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.10.13+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
     tar -xzf cpython-3.10.13+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
-    mv python3.10 python3.10_tmp
-    mv python3.10_tmp python3.10
+    mv python python3.10
     rm cpython-3.10.13*.tar.gz
     echo "✅ Python 3.10.13 已下载到 $SHARED/tools/python3.10"
 else
