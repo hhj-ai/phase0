@@ -7,26 +7,43 @@ WHEELS="$SHARED/data/wheels"
 echo "=== P0实验准备开始（CPU服务器） ==="
 echo "实验目的：验证JS散度作为视觉锚定度物理测谎仪的可行性，用于未来RL奖励信号。"
 
-mkdir -p $SHARED/{code,data/models/Qwen3-VL-8B-Instruct,data/datasets/hallusion_bench,data/datasets/coco_val2017,data/wheels,results,logs}
+mkdir -p $SHARED/{code,data/models/Qwen3-VL-8B-Instruct,data/datasets/hallusion_bench,data/datasets/coco_val2017,data/wheels,results,logs,tools}
 cd $SHARED/code
 
 cat > requirements_official.txt << EOF
-accelerate==0.33.0
-qwen-vl-utils==0.0.8
-huggingface_hub==0.25.2
-pillow==10.4.0
-numpy==1.24.4
-scipy==1.10.1
-pandas==2.0.3
-tqdm==4.66.5
-scikit-learn==1.3.2
-datasets==2.19.2
-pycocotools==2.0.7
+accelerate==1.2.1
+qwen-vl-utils==0.0.10
+huggingface_hub==0.27.0
+pillow==11.0.0
+numpy==1.26.4
+scipy==1.15.0
+pandas==2.2.3
+tqdm==4.67.1
+scikit-learn==1.6.0
+datasets==3.2.0
+pycocotools==2.0.8
 gdown==5.2.0
-matplotlib==3.7.5
+matplotlib==3.10.0
 EOF
 
-echo "强制使用官方PyPI + 跳过已下载包（全部Python 3.8兼容版）..."
+echo "下载 Python 3.10.13 预编译版本..."
+if [ ! -d "$SHARED/tools/python3.10" ]; then
+    cd $SHARED/tools
+    wget -q https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.10.13+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
+    tar -xzf cpython-3.10.13+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
+    mv python3.10 python3.10_tmp
+    mv python3.10_tmp python3.10
+    rm cpython-3.10.13*.tar.gz
+    echo "✅ Python 3.10.13 已下载到 $SHARED/tools/python3.10"
+else
+    echo "✅ Python 3.10.13 已存在，跳过"
+fi
+
+echo "使用 Python 3.10 创建虚拟环境..."
+$SHARED/tools/python3.10/bin/python3.10 -m venv $SHARED/venv/build_env
+source $SHARED/venv/build_env/bin/activate
+
+echo "强制使用官方PyPI + 跳过已下载包（全部Python 3.10兼容版）..."
 cd $WHEELS
 for pkg in $(cat $SHARED/code/requirements_official.txt); do
     pkg_name=$(echo $pkg | cut -d= -f1 | sed 's/==.*//')
@@ -42,7 +59,7 @@ for pkg in $(cat $SHARED/code/requirements_official.txt); do
     fi
 done
 
-echo "下载torch家族（cu124，兼容Python 3.8）..."
+echo "下载torch家族（cu124，兼容Python 3.10）..."
 python -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
   --index-url https://download.pytorch.org/whl/cu124 \
   --no-deps --no-cache-dir -d $WHEELS

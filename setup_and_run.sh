@@ -6,7 +6,8 @@ SHARED="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyu
 echo "=== P0实验启动（GPU服务器 8×H200） ==="
 echo "实验目的：验证JS散度作为视觉锚定度物理测谎仪的可行性，用于未来RL奖励信号。"
 
-python -m venv $SHARED/venv/p0_env --system-site-packages
+echo "使用预下载的 Python 3.10 创建虚拟环境..."
+$SHARED/tools/python3.10/bin/python3.10 -m venv $SHARED/venv/p0_env
 source $SHARED/venv/p0_env/bin/activate
 
 cd $SHARED/data/wheels
