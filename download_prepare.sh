@@ -21,7 +21,7 @@ pandas==2.0.3
 tqdm==4.66.5
 scikit-learn==1.3.2
 datasets==2.19.2
-pycocotools==2.0.8
+pycocotools==2.0.7
 gdown==5.2.0
 matplotlib==3.7.5
 EOF
