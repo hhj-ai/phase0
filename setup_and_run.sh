@@ -6,11 +6,9 @@ SHARED="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyu
 echo "=== P0实验启动（GPU服务器 8×H200） ==="
 echo "实验目的：验证JS散度作为视觉锚定度物理测谎仪的可行性，用于未来RL奖励信号。"
 
-# 创建虚拟环境
 python3.11 -m venv $SHARED/venv/p0_env --system-site-packages
 source $SHARED/venv/p0_env/bin/activate
 
-# 离线安装（严格顺序）
 cd $SHARED/data/wheels
 pip install --no-index --no-cache-dir --find-links=. torch torchvision torchaudio
 pip install --no-index --no-cache-dir --find-links=. accelerate huggingface_hub qwen-vl-utils pillow numpy scipy pandas tqdm scikit-learn datasets pycocotools gdown matplotlib

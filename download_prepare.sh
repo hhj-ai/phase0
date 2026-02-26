@@ -10,33 +10,32 @@ echo "实验目的：验证JS散度作为视觉锚定度物理测谎仪的可行
 mkdir -p $SHARED/{code,data/models/Qwen3-VL-8B-Instruct,data/datasets/hallusion_bench,data/datasets/coco_val2017,data/wheels,results,logs}
 cd $SHARED/code
 
-# requirements（官方镜像专用）
 cat > requirements_official.txt << EOF
 accelerate==0.34.2
 qwen-vl-utils==0.0.14
-flash-attn==2.7.4.post1
+flash-attn==2.6.3
 huggingface_hub==0.28.1
 pillow==11.1.0
-numpy==2.2.1
-scipy==1.15.1
+numpy==1.26.4
+scipy==1.13.1
 pandas==2.2.3
 tqdm==4.67.1
-scikit-learn==1.6.0
-datasets==3.2.0
+scikit-learn==1.5.2
+datasets==3.1.0
 pycocotools==2.0.8
 gdown==5.2.0
-matplotlib==3.10.0
+matplotlib==3.9.4
 EOF
 
-echo "强制使用官方PyPI镜像下载非torch包（已存在则跳过）..."
+echo "强制使用官方PyPI + 跳过已下载包..."
 cd $WHEELS
 for pkg in $(cat $SHARED/code/requirements_official.txt); do
-    pkg_name=$(echo $pkg | cut -d= -f1)
-    if ls $WHEELS | grep -q "$pkg_name"; then
+    pkg_name=$(echo $pkg | cut -d= -f1 | sed 's/==.*//')
+    if ls $WHEELS | grep -qi "$pkg_name"; then
         echo "✅ 已存在，跳过: $pkg"
     else
         echo "下载: $pkg"
-        python -m pip download "$pkg" --no-deps \
+        python3.11 -m pip download "$pkg" --no-deps \
           --index-url https://pypi.org/simple \
           --trusted-host pypi.org \
           --trusted-host files.pythonhosted.org \
@@ -44,22 +43,22 @@ for pkg in $(cat $SHARED/code/requirements_official.txt); do
     fi
 done
 
-echo "下载torch家族（官方cu124）..."
-python -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
+echo "下载torch家族（cu124）..."
+python3.11 -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
   --index-url https://download.pytorch.org/whl/cu124 \
   --no-deps --no-cache-dir -d $WHEELS
 
-echo "构建transformers主分支wheel（Qwen3-VL必需）..."
+echo "构建transformers主分支wheel..."
 if [ ! -f $WHEELS/transformers*.whl ]; then
     git clone --depth 1 https://github.com/huggingface/transformers.git $SHARED/code/transformers
-    cd $SHARED/code/transformers && python -m pip wheel . -w $WHEELS --no-deps
+    cd $SHARED/code/transformers && python3.11 -m pip wheel . -w $WHEELS --no-deps
     cd $SHARED/code
 else
-    echo "✅ transformers wheel 已存在，跳过构建"
+    echo "✅ transformers wheel 已存在，跳过"
 fi
 
 echo "下载Qwen3-VL-8B-Instruct模型（bf16全精度）..."
-python -c "
+python3.11 -c "
 from huggingface_hub import snapshot_download
 snapshot_download(repo_id='Qwen/Qwen3-VL-8B-Instruct',
                   local_dir='$SHARED/data/models/Qwen3-VL-8B-Instruct',
@@ -82,7 +81,7 @@ fi
 
 echo "下载COCO val2017..."
 cd $SHARED/data/datasets/coco_val2017
-if [ ! -f annotations/annotations_trainval2017.zip ]; then
+if [ ! -f annotations_trainval2017.zip ]; then
     wget -q http://images.cocodataset.org/zips/val2017.zip
     wget -q http://images.cocodataset.org/annotations/annotations_trainval2017.zip
     unzip -q val2017.zip

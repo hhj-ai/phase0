@@ -14,7 +14,7 @@ output logits层 + 中间hidden layers (16,20,24,28,32) 的JS散度是否能作�
 
 模型：Qwen/Qwen3-VL-8B-Instruct（bf16全精度，无任何量化）
 环境：8×H200，torchrun --nproc_per_node=8
-路径：全部硬编码在/shared路径下
+路径：全部硬编码
 """
 
 import os
@@ -31,7 +31,6 @@ from sklearn.metrics import roc_auc_score
 
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
-import torch.distributed as dist
 from accelerate import Accelerator
 
 def js_divergence(p, q):
@@ -39,22 +38,6 @@ def js_divergence(p, q):
     q = np.clip(q, 1e-10, 1)
     m = 0.5 * (p + q)
     return 0.5 * (entropy(p, m) + entropy(q, m))
-
-def calculate_patch_indices(bbox, grid_thw, patch_size=14):
-    """根据bbox和grid_thw计算需要替换的patch索引（进阶版token均值替换核心）"""
-    x1, y1, x2, y2 = bbox
-    h, w = grid_thw[1], grid_thw[2]
-    patch_h, patch_w = h // patch_size, w // patch_size
-    start_row = int(y1 / patch_size)
-    end_row = int(y2 / patch_size)
-    start_col = int(x1 / patch_size)
-    end_col = int(x2 / patch_size)
-    indices = []
-    for r in range(start_row, end_row):
-        for c in range(start_col, end_col):
-            idx = r * patch_w + c
-            indices.append(idx)
-    return indices
 
 def main(args):
     print("=== P0实验启动 ===")
@@ -68,7 +51,7 @@ def main(args):
         "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/models/Qwen3-VL-8B-Instruct",
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="flash_attention_2"
+        attn_implementation="sdpa"   # 使用内置sdpa，彻底解决flash-attn兼容问题
     )
     processor = AutoProcessor.from_pretrained(
         "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/models/Qwen3-VL-8B-Instruct"
@@ -76,20 +59,18 @@ def main(args):
 
     results = []
 
-    # 1. HallusionBench（presence/absence问题）
     hallusion_path = "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/datasets/hallusion_bench/HallusionBench.json"
     with open(hallusion_path) as f:
         data = json.load(f)[:args.num_samples // 2]
 
     for item in tqdm(data, desc="HallusionBench", disable=not accelerator.is_main_process):
-        if "is there" not in item['question'].lower() and "存在" not in item['question']:
+        if "is there" not in item.get('question','').lower() and "存在" not in item.get('question',''):
             continue
         img_path = f"/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/datasets/hallusion_bench/images/{item['image']}"
         image = Image.open(img_path).convert("RGB")
         question = item['question']
-        gt = int(item.get('answer', 1))  # 1=存在
+        gt = int(item.get('answer', 1))
 
-        # 正例/反例/控制
         messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]}]
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
@@ -98,7 +79,6 @@ def main(args):
         with torch.no_grad():
             orig_out = model(**inputs, output_hidden_states=True, return_dict=True)
 
-        # 简化版：bbox像素mask（快速验证，推荐先跑此版本）
         masked_image = image.copy()
         w, h = masked_image.size
         mask_box = (w//4, h//4, w*3//4, h*3//4)
@@ -111,7 +91,6 @@ def main(args):
         with torch.no_grad():
             masked_out = model(**masked_inputs, output_hidden_states=True, return_dict=True)
 
-        # 计算JS
         js_scores = {}
         p = torch.softmax(orig_out.logits[0, -1], dim=-1).cpu().float().numpy()
         q = torch.softmax(masked_out.logits[0, -1], dim=-1).cpu().float().numpy()
