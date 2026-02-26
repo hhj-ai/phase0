@@ -15,7 +15,7 @@ torch==2.4.1
 torchvision==0.19.1
 torchaudio==2.4.1
 --index-url https://download.pytorch.org/whl/cu124
-accelerate==1.3.0
+accelerate==1.2.1
 qwen-vl-utils==0.0.14
 flash-attn==2.7.4.post1
 huggingface_hub==0.28.1
@@ -31,8 +31,13 @@ gdown==5.2.0
 matplotlib==3.10.0
 EOF
 
-echo "下载wheels（--no-cache-dir）..."
-python -m pip download -r requirements.txt -d $SHARED/data/wheels --no-cache-dir --no-deps
+echo "下载wheels（强制使用公网pypi + 信任sankuai镜像绕过内部限制）..."
+python -m pip download -r requirements.txt -d $SHARED/data/wheels --no-cache-dir --no-deps \
+  --extra-index-url https://pypi.org/simple \
+  --trusted-host pypi.org \
+  --trusted-host pypi.python.org \
+  --trusted-host files.pythonhosted.org \
+  --trusted-host pip.sankuai.com
 
 echo "构建transformers主分支wheel（Qwen3-VL必需）..."
 git clone --depth 1 https://github.com/huggingface/transformers.git $SHARED/code/transformers

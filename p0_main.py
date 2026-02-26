@@ -100,7 +100,6 @@ def main(args):
 
         # 简化版：bbox像素mask（快速验证，推荐先跑此版本）
         masked_image = image.copy()
-        # 示例mask（实际应从COCO或检测获取bbox）
         w, h = masked_image.size
         mask_box = (w//4, h//4, w*3//4, h*3//4)
         mask_arr = np.array(masked_image)
@@ -114,18 +113,16 @@ def main(args):
 
         # 计算JS
         js_scores = {}
-        # logits (last token)
         p = torch.softmax(orig_out.logits[0, -1], dim=-1).cpu().float().numpy()
         q = torch.softmax(masked_out.logits[0, -1], dim=-1).cpu().float().numpy()
         js_scores['logits'] = js_divergence(p, q)
 
-        # 中间层 (Qwen3-VL hidden_states索引从0开始，深层为16+)
         for layer_idx in [16, 20, 24, 28, 32]:
             h_orig = orig_out.hidden_states[layer_idx][0, -1].cpu().float().numpy()
             h_mask = masked_out.hidden_states[layer_idx][0, -1].cpu().float().numpy()
             h_orig = h_orig / np.linalg.norm(h_orig + 1e-8)
             h_mask = h_mask / np.linalg.norm(h_mask + 1e-8)
-            js_scores[f'layer_{layer_idx}'] = js_divergence(h_orig, h_mask)  # 近似
+            js_scores[f'layer_{layer_idx}'] = js_divergence(h_orig, h_mask)
 
         results.append({
             'type': 'hallusion',
@@ -134,14 +131,10 @@ def main(args):
             **{k: v for k, v in js_scores.items() if 'layer' in k}
         })
 
-    # 2. COCO子集（精确正/反/控制，代码省略部分，可后续扩展，使用pycocotools）
-    # ... (类似处理，生成正例/反例/控制组)
-
     df = pd.DataFrame(results)
     os.makedirs("/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/results", exist_ok=True)
     df.to_csv("/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/results/js_results.csv", index=False)
 
-    # AUC评估
     if len(df) > 10:
         auc_logits = roc_auc_score(df['has_object'], df['js_logits'])
         print(f"\n=== P0实验结果总结 ===")
@@ -156,7 +149,6 @@ def main(args):
         else:
             print("P0未达阈值，建议检查mask策略或切换进阶token替换。")
 
-    # 绘制热力图
     layers = ['logits'] + [f'layer_{l}' for l in [16,20,24,28,32]]
     means = [df[l].mean() for l in layers if l in df.columns]
     plt.figure(figsize=(10,6))

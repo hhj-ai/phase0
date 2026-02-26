@@ -10,7 +10,7 @@ echo "实验目的：验证JS散度作为视觉锚定度物理测谎仪的可行
 python3.11 -m venv $SHARED/venv/p0_env --system-site-packages
 source $SHARED/venv/p0_env/bin/activate
 
-# 离线安装（严格顺序）
+# 离线安装（严格顺序，所有wheels已在共享盘）
 cd $SHARED/data/wheels
 pip install --no-index --no-cache-dir --find-links=. torch torchvision torchaudio
 pip install --no-index --no-cache-dir --find-links=. accelerate huggingface_hub qwen-vl-utils pillow numpy scipy pandas tqdm scikit-learn datasets pycocotools gdown matplotlib
