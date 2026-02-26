@@ -76,6 +76,9 @@ else
     echo "✅ transformers wheel 已存在，跳过"
 fi
 
+echo "安装huggingface_hub用于下载模型..."
+pip install --no-index --no-cache-dir --find-links=$WHEELS huggingface_hub
+
 echo "下载Qwen3-VL-8B-Instruct模型（bf16全精度）..."
 python -c "
 from huggingface_hub import snapshot_download
