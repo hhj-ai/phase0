@@ -118,10 +118,12 @@ echo ""
 echo "[3/4] 复制p0_experiment.py..."
 
 if [ ! -f "$CODE_DIR/p0_experiment.py" ]; then
-    if [ -f "$SHARED/p0_experiment.py" ]; then
-        cp "$SHARED/p0_experiment.py" "$CODE_DIR/"
-    elif [ -f "$(dirname $0)/p0_experiment.py" ]; then
-        cp "$(dirname $0)/p0_experiment.py" "$CODE_DIR/"
+    # 优先从phase0目录（脚本所在目录）复制
+    SCRIPT_DIR="$(dirname $(readlink -f $0))"
+    if [ -f "$SCRIPT_DIR/p0_experiment.py" ]; then
+        cp "$SCRIPT_DIR/p0_experiment.py" "$CODE_DIR/"
+    elif [ -f "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/phase0/p0_experiment.py" ]; then
+        cp "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/phase0/p0_experiment.py" "$CODE_DIR/"
     else
         echo "  ✗ 找不到p0_experiment.py！"
         exit 1
