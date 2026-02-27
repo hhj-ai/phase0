@@ -79,6 +79,36 @@ def shannon_entropy(p):
     """Shannon entropy in bits."""
     return float(entropy(_to_prob(p), base=2))
 
+def get_output_device_dtype(output):
+    """Safely extract device and dtype from model output dataclass.
+
+    Handles various output types from transformers models including
+    BaseModelOutputWithDeepstackFeatures and similar dataclasses.
+    """
+    # Try common tensor attributes in order of preference
+    for attr_name in ['pooler_output', 'last_hidden_state', 'hidden_states']:
+        if hasattr(output, attr_name):
+            val = getattr(output, attr_name)
+            if val is not None:
+                if attr_name == 'hidden_states' and isinstance(val, (tuple, list)):
+                    # hidden_states is a tuple, use the last layer
+                    if len(val) > 0 and torch.is_tensor(val[-1]):
+                        return val[-1].device, val[-1].dtype
+                elif torch.is_tensor(val):
+                    return val.device, val.dtype
+
+    # Fallback: scan all attributes for the first tensor
+    for attr_name in dir(output):
+        if not attr_name.startswith('_'):
+            try:
+                val = getattr(output, attr_name)
+                if torch.is_tensor(val):
+                    return val.device, val.dtype
+            except:
+                continue
+
+    raise ValueError(f"Cannot find tensor in output of type {type(output)}")
+
 def compute_all_metrics(orig_logits, cf_logits, lambda_e_values=[0.0, 0.05, 0.1, 0.2, 0.5]):
     """Compute all 6 metric variants."""
     p = _softmax(orig_logits)
@@ -153,23 +183,30 @@ class VisualTokenHook:
 
     def _fn(self, module, input, output):
         """Handle dataclass output with pooler_output field."""
+        # Safely get device and dtype from output
+        target_device, target_dtype = get_output_device_dtype(output)
+
         if self._modifications is None:
             # Capture mode: store pooler_output (merger output that goes to LLM)
-            self.captured = output.pooler_output.detach().clone()
+            if hasattr(output, 'pooler_output') and output.pooler_output is not None:
+                self.captured = output.pooler_output.detach().clone()
+            elif hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
+                self.captured = output.last_hidden_state.detach().clone()
             return output
         else:
             # Replace mode: modify pooler_output and return new dataclass
-            from copy import copy
-            mod = self.captured.clone().to(
-                device=output.pooler_output.device,
-                dtype=output.pooler_output.dtype
-            )
+            if self.captured is None:
+                return output
+            mod = self.captured.clone().to(device=target_device, dtype=target_dtype)
             for idx, val in self._modifications.items():
                 if 0 <= idx < mod.shape[0]:
                     mod[idx] = val.to(device=mod.device, dtype=mod.dtype)
             # Return modified dataclass
             out_copy = copy(output)
-            out_copy.pooler_output = mod
+            if hasattr(output, 'pooler_output'):
+                out_copy.pooler_output = mod
+            elif hasattr(output, 'last_hidden_state'):
+                out_copy.last_hidden_state = mod
             return out_copy
 
 # ============================================================
@@ -667,9 +704,12 @@ def run_probe(args):
             modified_features[idx] = replacement
 
     def replace_hook(module, input, output):
-        from copy import copy
+        target_device, target_dtype = get_output_device_dtype(output)
         out = copy(output)
-        out.pooler_output = modified_features.to(device=output.pooler_output.device, dtype=output.pooler_output.dtype)
+        if hasattr(out, 'pooler_output'):
+            out.pooler_output = modified_features.to(device=target_device, dtype=target_dtype)
+        elif hasattr(out, 'last_hidden_state'):
+            out.last_hidden_state = modified_features.to(device=target_device, dtype=target_dtype)
         return out
 
     handle2 = model.model.visual.register_forward_hook(replace_hook)
@@ -721,11 +761,12 @@ def run_probe(args):
             ctrl_features[idx] = ctrl_replacement
 
     def ctrl_hook(module, input, output):
+        target_device, target_dtype = get_output_device_dtype(output)
         out_copy = copy(output)
-        out_copy.pooler_output = ctrl_features.to(
-            device=output.pooler_output.device,
-            dtype=output.pooler_output.dtype
-        )
+        if hasattr(out_copy, 'pooler_output'):
+            out_copy.pooler_output = ctrl_features.to(device=target_device, dtype=target_dtype)
+        elif hasattr(out_copy, 'last_hidden_state'):
+            out_copy.last_hidden_state = ctrl_features.to(device=target_device, dtype=target_dtype)
         return out_copy
 
     handle3 = model.model.visual.register_forward_hook(ctrl_hook)
@@ -855,7 +896,7 @@ def run_worker(args):
 
     for sample in tqdm(shard_samples, desc=f"Worker-{args.shard_idx}"):
         r = process_sample(sample, model, processor, hook, device,
-                          layers, args.lambda_e_values)
+                          layers, args.lambda_e_values, spatial_merge_size)
         if r:
             results.append(r)
             behavior_counts[r["behavior"]] += 1

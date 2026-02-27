@@ -51,6 +51,9 @@ regex==2024.11.6
 tokenizers==0.21.0
 safetensors==0.5.2
 packaging==24.2
+einops==0.8.0
+protobuf==5.29.3
+sentencepiece==0.2.0
 EOF
 
 echo "[1/6] 下载 Python ${PYTHON_VERSION} standalone..."

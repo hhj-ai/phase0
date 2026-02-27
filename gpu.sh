@@ -27,6 +27,23 @@ echo "================================================================"
 echo ""
 
 # ============================================================
+# Screen Session Management
+# ============================================================
+SCREEN_NAME="p0_qwen3vl"
+echo "[*] Screen session management..."
+if screen -ls | grep -q "$SCREEN_NAME"; then
+    echo "  ⚠️  Screen session '$SCREEN_NAME' already exists"
+    echo "  Options: (r) reattach, (k) kill and create new, (q) quit"
+    # Default to kill and create new for automated runs
+    echo "  Auto-select: kill and create new"
+    screen -S "$SCREEN_NAME" -X quit 2>/dev/null || true
+fi
+screen -dmS "$SCREEN_NAME"
+echo "  ✓ Screen session '$SCREEN_NAME' created"
+echo "  To monitor: screen -r $SCREEN_NAME"
+echo ""
+
+# ============================================================
 # STEP 0: CUDA环境修复（必须在任何Python之前！）
 # ============================================================
 echo "[0/4] 修复CUDA库路径..."
@@ -59,29 +76,76 @@ source "$VENV/bin/activate"
 cd "$WHEELS"
 
 # 关键：全部用 --no-index，绝不联网
-echo "  安装torch..."
-pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
-    torch torchvision torchaudio 2>/dev/null || true
+# Installation order matters: torch -> huggingface_hub -> tokenizers -> transformers -> others
 
-echo "  安装huggingface_hub..."
+echo "  [1/6] 安装torch..."
+pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
+    torch torchvision torchaudio 2>/dev/null || {
+    echo "  ✗ torch安装失败，检查wheel文件是否存在"
+    ls -la torch*.whl 2>/dev/null || echo "    未找到torch wheel文件"
+    exit 1
+}
+
+echo "  [2/6] 安装huggingface_hub..."
 pip install --no-index --no-cache-dir --no-deps --force-reinstall \
     --no-warn-script-location \
-    huggingface_hub*.whl 2>/dev/null || true
+    huggingface_hub*.whl 2>/dev/null || {
+    echo "  ✗ huggingface_hub安装失败"
+    exit 1
+}
 
-echo "  安装transformers..."
+echo "  [3/6] 安装依赖包..."
+pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
+    numpy pillow filelock packaging pyyaml requests \
+    regex typing-extensions filelock networkx sympy 2>/dev/null || true
+
+echo "  [4/6] 安装tokenizers..."
+pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
+    tokenizers 2>/dev/null || true
+
+echo "  [5/6] 安装transformers..."
 TRANS_WHL=$(ls -t "$WHEELS"/transformers*.whl 2>/dev/null | head -1)
 [ -n "$TRANS_WHL" ] && pip install --no-index --no-cache-dir --no-deps \
-    --no-warn-script-location "$TRANS_WHL" 2>/dev/null || true
+    --no-warn-script-location "$TRANS_WHL" 2>/dev/null || {
+    echo "  ✗ transformers安装失败"
+    exit 1
+}
 
-echo "  安装其他依赖..."
+echo "  [6/6] 安装其他依赖..."
 pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
-    accelerate qwen-vl-utils pillow numpy scipy pandas \
-    tqdm scikit-learn pycocotools matplotlib \
-    regex tokenizers safetensors filelock packaging pyyaml requests 2>/dev/null || true
+    accelerate qwen-vl-utils scipy pandas tqdm scikit-learn \
+    pycocotools matplotlib safetensors datasets \
+    einops protobuf sentencepiece gdown 2>/dev/null || {
+    echo "  ⚠️  部分可选依赖安装失败，尝试继续..."
+}
 
 # 确认huggingface_hub版本
-echo "  确认huggingface_hub版本..."
-python -c "import huggingface_hub; print(f'  当前版本: {huggingface_hub.__version__}')" 2>/dev/null || echo "  警告: 无法检测huggingface_hub版本"
+echo ""
+echo "  确认关键包版本..."
+python -c "
+import sys
+print(f'Python: {sys.version}')
+try:
+    import huggingface_hub
+    print(f'huggingface_hub: {huggingface_hub.__version__}')
+except Exception as e:
+    print(f'huggingface_hub: 导入失败 - {e}')
+    sys.exit(1)
+try:
+    import transformers
+    print(f'transformers: {transformers.__version__}')
+except Exception as e:
+    print(f'transformers: 导入失败 - {e}')
+    sys.exit(1)
+try:
+    import einops
+    print(f'einops: {einops.__version__}')
+except:
+    print('einops: 未安装（可选）')
+" || {
+    echo "  ✗ 关键包导入失败"
+    exit 1
+}
 
 # ============================================================
 # STEP 2: 验证环境
@@ -89,27 +153,65 @@ python -c "import huggingface_hub; print(f'  当前版本: {huggingface_hub.__ve
 echo ""
 echo "[2/4] 验证环境..."
 
+echo "  检查PyTorch CUDA..."
 python -c "
 import torch
-assert torch.cuda.is_available(), 'CUDA不可用！'
-print(f'  ✓ torch {torch.__version__}, CUDA {torch.version.cuda}, {torch.cuda.device_count()} GPUs')
+if not torch.cuda.is_available():
+    print('✗ CUDA不可用！')
+    exit(1)
+print(f'✓ torch {torch.__version__}, CUDA {torch.version.cuda}, {torch.cuda.device_count()} GPUs')
 for i in range(min(torch.cuda.device_count(), $NUM_GPUS)):
     p = torch.cuda.get_device_properties(i)
-    print(f'    GPU {i}: {p.name}, {p.total_memory//1024**3}GB')
+    print(f'  GPU {i}: {p.name}, {p.total_memory//1024**3}GB')
 " || {
     echo "  ✗ torch CUDA失败"
     exit 1
 }
 
+echo ""
+echo "  检查transformers和Qwen3VL..."
 python -c "
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-print('  ✓ transformers + Qwen3VL OK')
+print('✓ transformers + Qwen3VL导入成功')
 import huggingface_hub
-print(f'  ✓ huggingface_hub {huggingface_hub.__version__}')
+print(f'✓ huggingface_hub {huggingface_hub.__version__}')
+import einops
+print(f'✓ einops {einops.__version__}')
 " || {
     echo "  ✗ transformers导入失败"
     exit 1
 }
+
+# Test model loading
+echo ""
+echo "  测试模型加载..."
+python -c "
+import torch
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+import os
+
+model_path = '$MODEL_PATH'
+if not os.path.exists(model_path):
+    print(f'✗ 模型路径不存在: {model_path}')
+    exit(1)
+
+device = torch.device('cuda:0')
+print(f'正在加载模型从 {model_path}...')
+model = Qwen3VLForConditionalGeneration.from_pretrained(
+    model_path, torch_dtype=torch.bfloat16, attn_implementation='sdpa'
+).to(device).eval()
+print(f'✓ 模型加载成功')
+print(f'  视觉编码器类型: {type(model.model.visual).__name__}')
+
+processor = AutoProcessor.from_pretrained(model_path)
+print(f'✓ Processor加载成功')
+" || {
+    echo "  ✗ 模型加载失败"
+    exit 1
+}
+
+echo ""
+echo "  ✓ 环境验证通过"
 
 # ============================================================
 # STEP 3: 复制Python脚本
