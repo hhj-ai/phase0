@@ -28,7 +28,7 @@ cd $SHARED/code
 cat > requirements.txt << 'EOF'
 accelerate==1.2.1
 qwen-vl-utils==0.0.10
-huggingface_hub==1.5.0
+huggingface_hub==0.28.1
 pillow==11.0.0
 numpy==1.26.4
 scipy==1.15.0

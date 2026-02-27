@@ -81,13 +81,7 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
 
 # 确认huggingface_hub版本
 echo "  确认huggingface_hub版本..."
-HF_VER=$(python -c "import huggingface_hub; print(huggingface_hub.__version__)" 2>/dev/null || echo "missing")
-if [[ "$HF_VER" != "1.5.0" && -f "$WHEELS/huggingface_hub-1.5.0-py3-none-any.whl" ]]; then
-    echo "  版本不匹配，强制恢复1.5.0..."
-    pip install --no-index --no-cache-dir --no-deps --force-reinstall \
-        --no-warn-script-location \
-        "$WHEELS/huggingface_hub-1.5.0-py3-none-any.whl" 2>/dev/null || true
-fi
+python -c "import huggingface_hub; print(f'  当前版本: {huggingface_hub.__version__}')" 2>/dev/null || echo "  警告: 无法检测huggingface_hub版本"
 
 # ============================================================
 # STEP 2: 验证环境
