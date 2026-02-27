@@ -280,32 +280,39 @@ def load_samples(ann_path: str, img_dir: str, n_samples: int = 400,
     print(f"Loaded {len(samples)} samples: {dict(task_counts)}")
     return samples
 
-def bbox_to_indices(bbox, img_w, img_h, grid_h, grid_w, debug=False):
-    """Map bbox coordinates to visual token indices."""
+def bbox_to_indices(bbox, img_w, img_h, grid_h, grid_w, spatial_merge_size=2, debug=False):
+    """Map bbox coordinates to visual token indices (using merged grid)."""
+    # Use merged grid dimensions (after spatial merge)
+    merged_h = grid_h // spatial_merge_size
+    merged_w = grid_w // spatial_merge_size
+
     x, y, w, h = bbox
-    col_start = max(0, int(x / img_w * grid_w))
-    col_end = min(grid_w, int(np.ceil((x+w) / img_w * grid_w)))
-    row_start = max(0, int(y / img_h * grid_h))
-    row_end = min(grid_h, int(np.ceil((y+h) / img_h * grid_h)))
-    indices = [r * grid_w + c for r in range(row_start, row_end) for c in range(col_start, col_end)]
+    col_start = max(0, int(x / img_w * merged_w))
+    col_end = min(merged_w, int(np.ceil((x+w) / img_w * merged_w)))
+    row_start = max(0, int(y / img_h * merged_h))
+    row_end = min(merged_h, int(np.ceil((y+h) / img_h * merged_h)))
+    indices = [r * merged_w + c for r in range(row_start, row_end) for c in range(col_start, col_end)]
 
     if debug:
-        print(f"  [bbox映射] 图像({img_w}x{img_h}px) -> Grid({grid_w}x{grid_h} tokens)")
+        print(f"  [bbox映射] 图像({img_w}x{img_h}px) -> Grid({grid_w}x{grid_h} / merge={spatial_merge_size} -> {merged_w}x{merged_h})")
         print(f"  [bbox映射] bbox({x:.0f},{y:.0f},{w:.0f},{h:.0f}px) -> tokens[{col_start}:{col_end}, {row_start}:{row_end}]")
-        print(f"  [bbox映射] 共{len(indices)}个tokens ({len(indices)/(grid_h*grid_w)*100:.1f}%)")
+        print(f"  [bbox映射] 共{len(indices)}个tokens ({len(indices)/(merged_h*merged_w)*100:.1f}%)")
 
     return indices
 
-def get_control_indices(all_bboxes, img_w, img_h, grid_h, grid_w, n):
+def get_control_indices(all_bboxes, img_w, img_h, grid_h, grid_w, n, spatial_merge_size=2):
     """Get control region indices (unoccupied by any bbox)."""
+    # Use merged grid dimensions
+    merged_grid_h = grid_h // spatial_merge_size
+    merged_grid_w = grid_w // spatial_merge_size
     occupied = set()
     for b in all_bboxes:
-        occupied.update(bbox_to_indices(b, img_w, img_h, grid_h, grid_w))
-    free = sorted(set(range(grid_h * grid_w)) - occupied)
+        occupied.update(bbox_to_indices(b, img_w, img_h, grid_h, grid_w, spatial_merge_size))
+    free = sorted(set(range(merged_grid_h * merged_grid_w)) - occupied)
     if len(free) >= n:
         start = random.randint(0, len(free) - n)
         return free[start:start+n]
-    return free if free else list(range(min(n, grid_h * grid_w)))
+    return free if free else list(range(min(n, merged_grid_h * merged_grid_w)))
 
 # ============================================================
 # Model Interaction
@@ -338,7 +345,7 @@ def get_model_answer(model, processor, image, question, device):
     else:
         return -1, answer_text
 
-def process_sample(sample, model, processor, hook, device, layers, lambda_e_values):
+def process_sample(sample, model, processor, hook, device, layers, lambda_e_values, spatial_merge_size=2):
     """Process a single sample through CED pipeline."""
     from qwen_vl_utils import process_vision_info
 
@@ -440,7 +447,7 @@ def process_sample(sample, model, processor, hook, device, layers, lambda_e_valu
     if behavior == "correct_positive":
         n_ctrl = max(4, len(target_idx))
         ctrl_idx = get_control_indices(sample["all_bboxes"], sample["img_w"], sample["img_h"],
-                                       grid_h, grid_w, n_ctrl)
+                                       grid_h, grid_w, n_ctrl, spatial_merge_size)
         surr_ctrl = sorted(set(range(vis_feat.shape[0])) - set(ctrl_idx))
         repl_ctrl = vis_feat[surr_ctrl].mean(0) if surr_ctrl else vis_feat.mean(0)
 
@@ -697,10 +704,13 @@ def run_probe(args):
     # Step 5: Control experiment
     print("\n--- Step 5: Control Comparison ---")
 
+    # Use merged grid for corner indices
+    merged_grid_h = grid_h // spatial_merge_size
+    merged_grid_w = grid_w // spatial_merge_size
     corner_indices = []
-    for r in range(min(2, grid_h)):
-        for c in range(min(2, grid_w)):
-            corner_indices.append(r * grid_w + c)
+    for r in range(min(2, merged_grid_h)):
+        for c in range(min(2, merged_grid_w)):
+            corner_indices.append(r * merged_grid_w + c)
 
     ctrl_surr = sorted(set(range(vis_features.shape[0])) - set(corner_indices))
     ctrl_replacement = vis_features[ctrl_surr].mean(dim=0) if ctrl_surr else vis_features.mean(dim=0)
@@ -711,7 +721,12 @@ def run_probe(args):
             ctrl_features[idx] = ctrl_replacement
 
     def ctrl_hook(module, input, output):
-        return ctrl_features.to(device=output.device, dtype=output.dtype)
+        out_copy = copy(output)
+        out_copy.pooler_output = ctrl_features.to(
+            device=output.pooler_output.device,
+            dtype=output.pooler_output.dtype
+        )
+        return out_copy
 
     handle3 = model.model.visual.register_forward_hook(ctrl_hook)
     with torch.no_grad():
@@ -812,13 +827,15 @@ def run_worker(args):
     # Load probe info
     probe_path = f"{RESULT_DIR}/p0a_probe_info.json"
     probe_info = None
+    spatial_merge_size = 2  # default
     if os.path.exists(probe_path):
         with open(probe_path) as f:
             probe_info = json.load(f)
         layers = [l for l in args.layers if l < probe_info["n_hidden_layers"]]
+        spatial_merge_size = probe_info.get("spatial_merge_size", 2)
         print(f"P0-a probe info loaded:")
         print(f"  grid: {probe_info['grid_h']}x{probe_info['grid_w']} (temporal={probe_info.get('grid_t', 1)})")
-        print(f"  spatial_merge_size: {probe_info.get('spatial_merge_size', 2)}")
+        print(f"  spatial_merge_size: {spatial_merge_size}")
         print(f"  patch_size: {probe_info.get('patch_size', 14)}")
         print(f"  hidden_dim: {probe_info['hidden_dim']}")
         print(f"  n_layers: {probe_info['n_hidden_layers']}, usable layers: {layers}")
