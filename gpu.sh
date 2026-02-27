@@ -27,21 +27,23 @@ echo "================================================================"
 echo ""
 
 # ============================================================
-# Screen Session Management
+# Screen Session Management (optional)
 # ============================================================
 SCREEN_NAME="p0_qwen3vl"
-echo "[*] Screen session management..."
-if screen -ls | grep -q "$SCREEN_NAME"; then
-    echo "  ⚠️  Screen session '$SCREEN_NAME' already exists"
-    echo "  Options: (r) reattach, (k) kill and create new, (q) quit"
-    # Default to kill and create new for automated runs
-    echo "  Auto-select: kill and create new"
-    screen -S "$SCREEN_NAME" -X quit 2>/dev/null || true
+if command -v screen &> /dev/null; then
+    echo "[*] Screen session management..."
+    if screen -ls | grep -q "$SCREEN_NAME" 2>/dev/null; then
+        echo "  ⚠️  Screen session '$SCREEN_NAME' already exists"
+        echo "  Auto-select: kill and create new"
+        screen -S "$SCREEN_NAME" -X quit 2>/dev/null || true
+    fi
+    screen -dmS "$SCREEN_NAME"
+    echo "  ✓ Screen session '$SCREEN_NAME' created"
+    echo "  To monitor: screen -r $SCREEN_NAME"
+    echo ""
+else
+    echo "[*] Screen not available, running without screen..."
 fi
-screen -dmS "$SCREEN_NAME"
-echo "  ✓ Screen session '$SCREEN_NAME' created"
-echo "  To monitor: screen -r $SCREEN_NAME"
-echo ""
 
 # ============================================================
 # STEP 0: CUDA环境修复（必须在任何Python之前！）
