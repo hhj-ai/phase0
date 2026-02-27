@@ -20,6 +20,7 @@ import random
 import argparse
 import warnings
 import glob
+from copy import copy
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -151,15 +152,25 @@ class VisualTokenHook:
         self._modifications = mods
 
     def _fn(self, module, input, output):
+        """Handle dataclass output with pooler_output field."""
         if self._modifications is None:
-            self.captured = output.detach().clone()
+            # Capture mode: store pooler_output (merger output that goes to LLM)
+            self.captured = output.pooler_output.detach().clone()
             return output
         else:
-            mod = self.captured.clone().to(device=output.device, dtype=output.dtype)
+            # Replace mode: modify pooler_output and return new dataclass
+            from copy import copy
+            mod = self.captured.clone().to(
+                device=output.pooler_output.device,
+                dtype=output.pooler_output.dtype
+            )
             for idx, val in self._modifications.items():
                 if 0 <= idx < mod.shape[0]:
                     mod[idx] = val.to(device=mod.device, dtype=mod.dtype)
-            return mod
+            # Return modified dataclass
+            out_copy = copy(output)
+            out_copy.pooler_output = mod
+            return out_copy
 
 # ============================================================
 # Data Loading
@@ -564,9 +575,10 @@ def run_probe(args):
     captured_output = {}
 
     def capture_hook(module, input, output):
-        captured_output["shape"] = output.shape
-        captured_output["dtype"] = output.dtype
-        captured_output["tensor"] = output.detach().clone()
+        # output is a dataclass with pooler_output field
+        captured_output["shape"] = output.pooler_output.shape
+        captured_output["dtype"] = output.pooler_output.dtype
+        captured_output["tensor"] = output.pooler_output.detach().clone()
         return output
 
     handle = model.model.visual.register_forward_hook(capture_hook)
@@ -648,7 +660,10 @@ def run_probe(args):
             modified_features[idx] = replacement
 
     def replace_hook(module, input, output):
-        return modified_features.to(device=output.device, dtype=output.dtype)
+        from copy import copy
+        out = copy(output)
+        out.pooler_output = modified_features.to(device=output.pooler_output.device, dtype=output.pooler_output.dtype)
+        return out
 
     handle2 = model.model.visual.register_forward_hook(replace_hook)
     with torch.no_grad():
