@@ -12,7 +12,8 @@ WHEELS="$SHARED/data/wheels"
 # 可配置参数
 PYTHON_VERSION="${PYTHON_VERSION:-3.10.13}"
 TORCH_VERSION="${TORCH_VERSION:-2.4.1}"
-CUDA_VERSION="${CUDA_VERSION:-cu124}"
+# PyTorch wheel URL uses short form: cu118, cu121, cu124
+torch_cuda_version="${TORCH_CUDA_VERSION:-cu124}"
 
 echo "================================================================"
 echo "  P0实验准备（CPU服务器 - 有网环境）"
@@ -81,9 +82,9 @@ pip download -r $SHARED/code/requirements.txt \
     --trusted-host files.pythonhosted.org \
     --no-cache-dir -d $WHEELS
 
-echo "  下载torch家族 (${CUDA_VERSION})..."
+echo "  下载torch家族 (${torch_cuda_version})..."
 pip download torch==${TORCH_VERSION} torchvision==0.19.1 torchaudio==${TORCH_VERSION} \
-    --index-url https://download.pytorch.org/whl/${CUDA_VERSION} \
+    --index-url https://download.pytorch.org/whl/${torch_cuda_version} \
     --no-deps --no-cache-dir -d $WHEELS
 
 echo ""
