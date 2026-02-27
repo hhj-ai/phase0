@@ -40,7 +40,7 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
     torch torchvision torchaudio 2>/dev/null || true
 pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
     accelerate huggingface_hub qwen-vl-utils pillow numpy scipy pandas \
-    tqdm scikit-learn datasets pycocotools gdown matplotlib 2>/dev/null || true
+    tqdm scikit-learn datasets pycocotools gdown matplotlib regex 2>/dev/null || true
 for whl in transformers*.whl; do
     [ -f "$whl" ] && pip install --no-index --no-cache-dir --find-links=. \
         --no-warn-script-location --no-deps "$whl" 2>/dev/null && break
