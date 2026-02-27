@@ -89,9 +89,11 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
 }
 
 echo "  [2/6] 安装huggingface_hub..."
-# Get the latest version of huggingface_hub
-HF_WHL=$(ls -t "$WHEELS"/huggingface_hub-*.whl 2>/dev/null | head -1)
-if [ -n "$HF_WHL" ]; then
+# Remove any old versions to avoid conflicts
+rm -f "$WHEELS"/huggingface_hub-0.27*.whl 2>/dev/null || true
+# Use specific version that transformers requires
+HF_WHL="$WHEELS/huggingface_hub-0.28.1-py3-none-any.whl"
+if [ -f "$HF_WHL" ]; then
     pip install --no-index --no-cache-dir --no-deps --force-reinstall \
         --no-warn-script-location \
         "$HF_WHL" 2>/dev/null || {
@@ -99,7 +101,7 @@ if [ -n "$HF_WHL" ]; then
         exit 1
     }
 else
-    echo "  ✗ 未找到huggingface_hub wheel文件"
+    echo "  ✗ 未找到huggingface_hub-0.28.1 wheel文件"
     exit 1
 fi
 
