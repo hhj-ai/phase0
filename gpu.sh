@@ -89,7 +89,9 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
 }
 
 echo "  [2/6] 安装huggingface_hub..."
-# Remove any old versions to avoid conflicts
+# Force uninstall any existing version to avoid conflicts
+pip uninstall -y huggingface_hub 2>/dev/null || true
+# Remove any old wheel files to avoid confusion
 rm -f "$WHEELS"/huggingface_hub-0.27*.whl 2>/dev/null || true
 # Use specific version that transformers requires
 HF_WHL="$WHEELS/huggingface_hub-0.28.1-py3-none-any.whl"
