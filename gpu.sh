@@ -95,7 +95,7 @@ assert torch.cuda.is_available(), 'CUDA不可用！'
 print(f'  ✓ torch {torch.__version__}, CUDA {torch.version.cuda}, {torch.cuda.device_count()} GPUs')
 for i in range(min(torch.cuda.device_count(), $NUM_GPUS)):
     p = torch.cuda.get_device_properties(i)
-    print(f'    GPU {i}: {p.name}, {p.total_mem//1024**3}GB')
+    print(f'    GPU {i}: {p.name}, {p.total_memory//1024**3}GB')
 " || {
     echo "  ✗ torch CUDA失败"
     exit 1

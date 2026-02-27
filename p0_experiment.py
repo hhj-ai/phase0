@@ -136,7 +136,7 @@ class VisualTokenHook:
         self._handle = None
 
     def register(self, model):
-        self._handle = model.visual.register_forward_hook(self._fn)
+        self._handle = model.model.visual.register_forward_hook(self._fn)
         return self
 
     def remove(self):
@@ -473,31 +473,31 @@ def run_probe(args):
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
-    print(f"\nmodel.visual type: {type(model.visual).__name__}")
-    if hasattr(model.visual, 'merger'):
-        print(f"model.visual.merger type: {type(model.visual.merger).__name__}")
+    print(f"\nmodel.model.visual type: {type(model.model.visual).__name__}")
+    if hasattr(model.model.visual, 'merger'):
+        print(f"model.model.visual.merger type: {type(model.model.visual.merger).__name__}")
 
     # Architecture parameter detection
     print("\n--- Architecture Parameters ---")
-    spatial_merge_size = getattr(model.visual, 'spatial_merge_size', None)
-    if spatial_merge_size is None and hasattr(model.visual, 'config'):
-        spatial_merge_size = getattr(model.visual.config, 'spatial_merge_size', None)
+    spatial_merge_size = getattr(model.model.visual, 'spatial_merge_size', None)
+    if spatial_merge_size is None and hasattr(model.model.visual, 'config'):
+        spatial_merge_size = getattr(model.model.visual.config, 'spatial_merge_size', None)
     if spatial_merge_size is None:
         spatial_merge_size = 2
         print(f"  spatial_merge_size: not detected, using default {spatial_merge_size}")
     else:
         print(f"  spatial_merge_size: {spatial_merge_size} (merges {spatial_merge_size}x{spatial_merge_size} patches per token)")
 
-    patch_size = getattr(model.visual, 'patch_size', None)
-    if patch_size is None and hasattr(model.visual, 'config'):
-        patch_size = getattr(model.visual.config, 'patch_size', None)
+    patch_size = getattr(model.model.visual, 'patch_size', None)
+    if patch_size is None and hasattr(model.model.visual, 'config'):
+        patch_size = getattr(model.model.visual.config, 'patch_size', None)
     if patch_size is None:
         patch_size = 14
         print(f"  patch_size: not detected, using default {patch_size}")
     else:
         print(f"  patch_size: {patch_size}")
 
-    vis_params = sum(p.numel() for p in model.visual.parameters())
+    vis_params = sum(p.numel() for p in model.model.visual.parameters())
     print(f"\nVisual encoder parameters: {vis_params / 1e6:.1f}M")
 
     # Step 2: Single image forward pass
@@ -569,7 +569,7 @@ def run_probe(args):
         captured_output["tensor"] = output.detach().clone()
         return output
 
-    handle = model.visual.register_forward_hook(capture_hook)
+    handle = model.model.visual.register_forward_hook(capture_hook)
 
     with torch.no_grad():
         orig_out = model(**inputs, output_hidden_states=True, return_dict=True)
@@ -650,7 +650,7 @@ def run_probe(args):
     def replace_hook(module, input, output):
         return modified_features.to(device=output.device, dtype=output.dtype)
 
-    handle2 = model.visual.register_forward_hook(replace_hook)
+    handle2 = model.model.visual.register_forward_hook(replace_hook)
     with torch.no_grad():
         cf_out = model(**inputs, output_hidden_states=True, return_dict=True)
     handle2.remove()
@@ -698,7 +698,7 @@ def run_probe(args):
     def ctrl_hook(module, input, output):
         return ctrl_features.to(device=output.device, dtype=output.dtype)
 
-    handle3 = model.visual.register_forward_hook(ctrl_hook)
+    handle3 = model.model.visual.register_forward_hook(ctrl_hook)
     with torch.no_grad():
         ctrl_out = model(**inputs, output_hidden_states=True, return_dict=True)
     handle3.remove()
