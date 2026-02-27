@@ -49,24 +49,15 @@ echo "使用 Python 3.10 创建虚拟环境..."
 $SHARED/tools/python3.10/bin/python3.10 -m venv $SHARED/venv/build_env
 source $SHARED/venv/build_env/bin/activate
 
-echo "强制使用官方PyPI + 跳过已下载包（全部Python 3.10兼容版）..."
+echo "强制使用官方PyPI下载所有包及其依赖（全部Python 3.10兼容版）..."
 cd $WHEELS
-for pkg in $(cat $SHARED/code/requirements_official.txt); do
-    # 提取包名和版本（格式：name==version）
-    pkg_name=$(echo $pkg | cut -d'=' -f1)
-    pkg_version=$(echo $pkg | cut -d'=' -f3)
-    # 检查是否已存在该版本的wheel（匹配 name-version* 模式）
-    if ls $WHEELS 2>/dev/null | grep -q "^${pkg_name}-${pkg_version}"; then
-        echo "✅ 已存在，跳过: $pkg"
-    else
-        echo "下载: $pkg"
-        python -m pip download "$pkg" \
-          --index-url https://pypi.org/simple \
-          --trusted-host pypi.org \
-          --trusted-host files.pythonhosted.org \
-          --no-cache-dir -d $WHEELS
-    fi
-done
+
+# 批量下载所有包及其依赖（pip会自动处理依赖）
+python -m pip download -r $SHARED/code/requirements_official.txt \
+  --index-url https://pypi.org/simple \
+  --trusted-host pypi.org \
+  --trusted-host files.pythonhosted.org \
+  --no-cache-dir -d $WHEELS
 
 echo "下载torch家族（cu124，兼容Python 3.10）..."
 python -m pip download torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
