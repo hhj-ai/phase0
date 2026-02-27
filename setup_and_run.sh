@@ -11,9 +11,9 @@ $SHARED/tools/python3.10/bin/python3.10 -m venv $SHARED/venv/p0_env
 source $SHARED/venv/p0_env/bin/activate
 
 cd $SHARED/data/wheels
-pip install --no-index --no-cache-dir --find-links=. torch torchvision torchaudio
-pip install --no-index --no-cache-dir --find-links=. accelerate huggingface_hub qwen-vl-utils pillow numpy scipy pandas tqdm scikit-learn datasets pycocotools gdown matplotlib
-pip install --no-index --no-cache-dir --find-links=. --no-deps $SHARED/code/transformers/*.whl
+pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location torch torchvision torchaudio
+pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location accelerate huggingface_hub qwen-vl-utils pillow numpy scipy pandas tqdm scikit-learn datasets pycocotools gdown matplotlib
+pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location --no-deps $SHARED/code/transformers/*.whl
 
 cd $SHARED/code
 
