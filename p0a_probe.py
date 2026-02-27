@@ -50,9 +50,48 @@ def main():
     print(f"\nmodel.visual 类型: {type(model.visual).__name__}")
     if hasattr(model.visual, 'merger'):
         print(f"model.visual.merger 类型: {type(model.visual.merger).__name__}")
+
+    # ============================================================
+    # 关键架构参数检测（影响bbox→token映射）
+    # ============================================================
+    print("\n--- 架构参数检测 ---")
+
+    # 检测spatial_merge_size（merger降采样比例，默认=2表示2x2合并）
+    spatial_merge_size = getattr(model.visual, 'spatial_merge_size', None)
+    if spatial_merge_size is None and hasattr(model.visual, 'config'):
+        spatial_merge_size = getattr(model.visual.config, 'spatial_merge_size', None)
+    if spatial_merge_size is None:
+        spatial_merge_size = 2  # Qwen3-VL默认值
+        print(f"  spatial_merge_size: 未检测到，使用默认值 {spatial_merge_size}")
+    else:
+        print(f"  spatial_merge_size: {spatial_merge_size} (每{spatial_merge_size}x{spatial_merge_size}个patch合并为1个token)")
+
+    # 检测patch_size（默认=14）
+    patch_size = getattr(model.visual, 'patch_size', None)
+    if patch_size is None and hasattr(model.visual, 'config'):
+        patch_size = getattr(model.visual.config, 'patch_size', None)
+    if patch_size is None:
+        patch_size = 14  # Qwen3-VL默认值
+        print(f"  patch_size: 未检测到，使用默认值 {patch_size}")
+    else:
+        print(f"  patch_size: {patch_size}")
+
+    # 计算理论token数量
+    theoretical_patches_h = img_h / patch_size
+    theoretical_patches_w = img_w / patch_size
+    theoretical_tokens_h = theoretical_patches_h / spatial_merge_size
+    theoretical_tokens_w = theoretical_patches_w / spatial_merge_size
+    theoretical_total = theoretical_tokens_h * theoretical_tokens_w
+
+    print(f"\n  理论计算:")
+    print(f"    图像尺寸: {img_w} x {img_h}")
+    print(f"    Patch后: {theoretical_patches_h:.1f} x {theoretical_patches_w:.1f} = {theoretical_patches_h * theoretical_patches_w:.0f} patches")
+    print(f"    Merge后: {theoretical_tokens_h:.1f} x {theoretical_tokens_w:.1f} = {theoretical_total:.0f} tokens")
+    print(f"    (除以 spatial_merge_size={spatial_merge_size})")
+
     # 统计visual encoder参数量
     vis_params = sum(p.numel() for p in model.visual.parameters())
-    print(f"Visual encoder参数量: {vis_params / 1e6:.1f}M")
+    print(f"\nVisual encoder参数量: {vis_params / 1e6:.1f}M")
 
     # ============================================================
     # Step 2: 单张图片前向，检查visual输出shape
@@ -173,9 +212,20 @@ def main():
         for c in range(col_start, col_end):
             target_indices.append(r * grid_w + c)
 
-    print(f"目标区域: rows [{row_start},{row_end}), cols [{col_start},{col_end})")
-    print(f"目标token数: {len(target_indices)} / {grid_h * grid_w} 总tokens")
-    print(f"目标区域占比: {len(target_indices) / (grid_h * grid_w) * 100:.1f}%")
+    # ============================================================
+    # 增强的bbox映射验证
+    # ============================================================
+    print(f"\n--- bbox映射验证 ---")
+    print(f"  图像尺寸: {img_w} x {img_h} 像素")
+    print(f"  Grid尺寸: {grid_w} x {grid_h} tokens")
+    print(f"  BBox (xywh): [{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]")
+    print(f"  BBox中心: ({bbox[0] + bbox[2]/2:.1f}, {bbox[1] + bbox[3]/2:.1f})")
+    print(f"  映射token范围: cols [{col_start}, {col_end}), rows [{row_start}, {row_end})")
+    token_center_x = (col_start + col_end) / 2
+    token_center_y = (row_start + row_end) / 2
+    print(f"  映射token中心: ({token_center_x:.1f}, {token_center_y:.1f})")
+    print(f"  目标token数: {len(target_indices)} / {grid_h * grid_w} 总tokens")
+    print(f"  目标区域占比: {len(target_indices) / (grid_h * grid_w) * 100:.1f}%")
 
     # 计算替换值（周围token均值）
     vis_features = captured_output["tensor"]
@@ -316,6 +366,8 @@ def main():
         "visual_output_shape": list(vis_shape),
         "js_object_region": float(js),
         "js_control_region": float(js_ctrl),
+        "spatial_merge_size": spatial_merge_size if 'spatial_merge_size' in locals() else 2,
+        "patch_size": patch_size if 'patch_size' in locals() else 14,
         "all_passed": all_pass,
     }
     os.makedirs(f"{BASE}/results", exist_ok=True)

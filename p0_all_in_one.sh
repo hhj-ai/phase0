@@ -238,6 +238,17 @@ def run_probe(model,proc,dev):
     else: obj="object"; bb=[iw*.25,ih*.25,iw*.5,ih*.5]
     print(f"图片: {info['file_name']} ({iw}x{ih}), 物体: {obj}")
 
+    # 架构参数检测
+    print("\n--- 架构参数检测 ---")
+    sms=getattr(model.visual,'spatial_merge_size',None)
+    if sms is None and hasattr(model.visual,'config'):
+        sms=getattr(model.visual.config,'spatial_merge_size',2)
+    ps=getattr(model.visual,'patch_size',None)
+    if ps is None and hasattr(model.visual,'config'):
+        ps=getattr(model.visual.config,'patch_size',14)
+    print(f"  spatial_merge_size: {sms} (每{sms}x{sms}patch合并为1token)")
+    print(f"  patch_size: {ps}")
+
     inp=mk_inp(proc,img,f"Is there a {obj} in this image? Answer yes or no.",dev)
     gthw=inp["image_grid_thw"]; assert gthw is not None
     gt_,gh,gw=gthw[0].tolist(); print(f"grid: t={gt_},h={gh},w={gw}")
@@ -253,7 +264,12 @@ def run_probe(model,proc,dev):
     tok_ok=abs(act-exp)<10; nl=len(orig.hidden_states); hd=vs[-1]
     print(f"hidden_dim={hd}, layers={nl}")
 
+    # bbox映射验证
+    print(f"\n--- bbox映射验证 ---")
+    print(f"  图像: {iw}x{ih}px, Grid: {gw}x{gh} tokens")
     ti=bbox2idx(bb,iw,ih,gh,gw); vf=cap["t"]
+    print(f"  bbox: {[round(x,1) for x in bb]}, tokens: {len(ti)}个 ({len(ti)/(gh*gw)*100:.1f}%)")
+
     si=sorted(set(range(vf.shape[0]))-set(ti)); rp=vf[si].mean(0) if si else vf.mean(0)
     mf=vf.clone()
     for i in ti:
@@ -282,7 +298,8 @@ def run_probe(model,proc,dev):
     print(f"  {'✅' if obj_ok else '⚠️'} 物体>角落 ({js_obj/max(js_c,1e-12):.1f}x)")
     ok=tok_ok and rep_ok and obj_ok
     sl=[l for l in [16,20,24,28,32] if l<nl]
-    nfo={"gh":gh,"gw":gw,"gt":gt_,"hd":hd,"nl":nl,"sl":sl,"js_obj":float(js_obj),"js_c":float(js_c),"ok":ok}
+    nfo={"gh":gh,"gw":gw,"gt":gt_,"hd":hd,"nl":nl,"sl":sl,"js_obj":float(js_obj),"js_c":float(js_c),"ok":ok,
+         "sms":sms if sms else 2,"ps":ps if ps else 14}
     with open(f"{RESULT_DIR}/p0a_info.json","w") as f: json.dump(nfo,f,indent=2)
     print(f"\n{'✅ P0-a PASSED' if ok else '❌ P0-a FAILED'}")
     return ok,nfo
@@ -386,6 +403,7 @@ def run_worker(args):
     hook=VTHook().reg(model)
     with open(f"{RESULT_DIR}/p0a_info.json") as f: info=json.load(f)
     layers=info.get("sl",[16,20,24,28,32])
+    print(f"[W{sid}] P0-a探测: grid={info['gh']}x{info['gw']}, sms={info.get('sms',2)}, ps={info.get('ps',14)}, layers={layers}")
     all_s=load_samples(n=args.num_samples); my_s=[s for i,s in enumerate(all_s) if i%ns==sid]
     print(f"[W{sid}] 总{len(all_s)}, 本shard: {len(my_s)}")
     results=[]; bc=defaultdict(int)

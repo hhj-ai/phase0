@@ -303,13 +303,32 @@ def get_model_answer(model, processor, image, question, device):
         return -1, answer_text  # 无法解析
 
 
-def bbox_to_indices(bbox, img_w, img_h, grid_h, grid_w):
+def bbox_to_indices(bbox, img_w, img_h, grid_h, grid_w, debug=False):
+    """
+    将bbox坐标映射到visual token索引。
+
+    Args:
+        bbox: [x, y, w, h] 像素坐标
+        img_w, img_h: 图像尺寸
+        grid_h, grid_w: visual token grid尺寸
+        debug: 是否打印调试信息
+
+    Returns:
+        被bbox覆盖的token索引列表
+    """
     x, y, w, h = bbox
-    cs = max(0, int(x / img_w * grid_w))
-    ce = min(grid_w, int(np.ceil((x+w) / img_w * grid_w)))
-    rs = max(0, int(y / img_h * grid_h))
-    re = min(grid_h, int(np.ceil((y+h) / img_h * grid_h)))
-    return [r * grid_w + c for r in range(rs, re) for c in range(cs, ce)]
+    col_start = max(0, int(x / img_w * grid_w))
+    col_end = min(grid_w, int(np.ceil((x+w) / img_w * grid_w)))
+    row_start = max(0, int(y / img_h * grid_h))
+    row_end = min(grid_h, int(np.ceil((y+h) / img_h * grid_h)))
+    indices = [r * grid_w + c for r in range(row_start, row_end) for c in range(col_start, col_end)]
+
+    if debug:
+        print(f"  [bbox映射] 图像({img_w}x{img_h}px) -> Grid({grid_w}x{grid_h} tokens)")
+        print(f"  [bbox映射] bbox({x:.0f},{y:.0f},{w:.0f},{h:.0f}px) -> tokens[{col_start}:{col_end}, {row_start}:{row_end}]")
+        print(f"  [bbox映射] 共{len(indices)}个tokens ({len(indices)/(grid_h*grid_w)*100:.1f}%)")
+
+    return indices
 
 
 def get_control_indices(all_bboxes, img_w, img_h, grid_h, grid_w, n):
@@ -470,13 +489,21 @@ def main(args):
 
     # 加载probe信息
     probe_path = f"{BASE}/results/p0a_probe_info.json"
+    probe_info = None
     if os.path.exists(probe_path):
         with open(probe_path) as f:
-            probe = json.load(f)
-        layers = [l for l in args.layers if l < probe["n_hidden_layers"]]
-        print(f"P0-a探测: grid={probe['grid_h']}x{probe['grid_w']}, layers={layers}")
+            probe_info = json.load(f)
+        layers = [l for l in args.layers if l < probe_info["n_hidden_layers"]]
+        print(f"P0-a探测信息:")
+        print(f"  grid: {probe_info['grid_h']}x{probe_info['grid_w']} (temporal={probe_info.get('grid_t', 1)})")
+        print(f"  spatial_merge_size: {probe_info.get('spatial_merge_size', 2)}")
+        print(f"  patch_size: {probe_info.get('patch_size', 14)}")
+        print(f"  hidden_dim: {probe_info['hidden_dim']}")
+        print(f"  n_layers: {probe_info['n_hidden_layers']}, 可用中间层: {layers}")
+        print(f"  P0-a状态: {'✅ PASSED' if probe_info.get('all_passed') else '❌ FAILED'}")
     else:
         layers = args.layers
+        print(f"警告: 未找到P0-a探测信息，使用默认layers: {layers}")
 
     samples = load_samples(COCO_ANN_PATH, COCO_IMG_DIR, n_samples=args.num_samples)
 
