@@ -52,8 +52,11 @@ source $SHARED/venv/build_env/bin/activate
 echo "强制使用官方PyPI + 跳过已下载包（全部Python 3.10兼容版）..."
 cd $WHEELS
 for pkg in $(cat $SHARED/code/requirements_official.txt); do
-    pkg_name=$(echo $pkg | cut -d= -f1 | sed 's/==.*//')
-    if ls $WHEELS | grep -qi "$pkg_name"; then
+    # 提取包名和版本（格式：name==version）
+    pkg_name=$(echo $pkg | cut -d'=' -f1)
+    pkg_version=$(echo $pkg | cut -d'=' -f3)
+    # 检查是否已存在该版本的wheel（匹配 name-version* 模式）
+    if ls $WHEELS 2>/dev/null | grep -q "^${pkg_name}-${pkg_version}"; then
         echo "✅ 已存在，跳过: $pkg"
     else
         echo "下载: $pkg"
