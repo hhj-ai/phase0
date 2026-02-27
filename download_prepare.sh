@@ -31,6 +31,7 @@ requests==2.32.3
 jinja2==3.1.4
 networkx==3.4.2
 sympy==1.13.3
+regex==2024.11.6
 EOF
 
 echo "下载 Python 3.10.13 预编译版本..."
