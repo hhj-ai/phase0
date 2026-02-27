@@ -40,7 +40,12 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
     torch torchvision torchaudio 2>/dev/null || true
 pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
     accelerate huggingface_hub qwen-vl-utils pillow numpy scipy pandas \
-    tqdm scikit-learn datasets pycocotools gdown matplotlib regex tokenizers 2>/dev/null || true
+    tqdm scikit-learn datasets pycocotools gdown matplotlib 2>/dev/null || true
+# transformers的隐式依赖（--no-deps会跳过这些）
+pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
+    regex tokenizers safetensors filelock packaging pyyaml requests 2>/dev/null || true
+# 如果wheels里没有regex，尝试联网装
+python -c "import regex" 2>/dev/null || pip install regex 2>/dev/null || true
 for whl in transformers*.whl; do
     [ -f "$whl" ] && pip install --no-index --no-cache-dir --find-links=. \
         --no-warn-script-location --no-deps "$whl" 2>/dev/null && break
