@@ -89,12 +89,19 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
 }
 
 echo "  [2/6] 安装huggingface_hub..."
-pip install --no-index --no-cache-dir --no-deps --force-reinstall \
-    --no-warn-script-location \
-    huggingface_hub*.whl 2>/dev/null || {
-    echo "  ✗ huggingface_hub安装失败"
+# Get the latest version of huggingface_hub
+HF_WHL=$(ls -t "$WHEELS"/huggingface_hub-*.whl 2>/dev/null | head -1)
+if [ -n "$HF_WHL" ]; then
+    pip install --no-index --no-cache-dir --no-deps --force-reinstall \
+        --no-warn-script-location \
+        "$HF_WHL" 2>/dev/null || {
+        echo "  ✗ huggingface_hub安装失败"
+        exit 1
+    }
+else
+    echo "  ✗ 未找到huggingface_hub wheel文件"
     exit 1
-}
+fi
 
 echo "  [3/6] 安装依赖包..."
 pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
