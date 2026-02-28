@@ -807,13 +807,14 @@ def run_probe(args):
     print(f"\nExpected visual tokens: {expected_tokens} (from grid_thw)")
     print(f"Actual visual tokens: {actual_tokens} (from hook output)")
 
+    merger_ratio = expected_tokens / actual_tokens if actual_tokens > 0 else 1
     if actual_tokens == expected_tokens:
-        print("OK: Visual token count matches!")
-        merger_ratio = 1
+        print("OK: Visual token count matches (no merge)")
+    elif abs(merger_ratio - spatial_merge_size ** 2) < 0.5:
+        print(f"OK: pooler_output is post-merge ({actual_tokens} = {expected_tokens}/{spatial_merge_size}^2)")
+        print(f"  This is expected: spatial_merge_size={spatial_merge_size}, ratio={merger_ratio:.0f}")
     else:
-        ratio = expected_tokens / actual_tokens if actual_tokens > 0 else 0
-        print(f"Mismatch! Ratio = {ratio:.1f}")
-        merger_ratio = ratio
+        print(f"WARNING: Unexpected token ratio = {merger_ratio:.1f}")
 
     hidden_dim = vis_shape[-1]
     print(f"Hidden dim: {hidden_dim}")
@@ -948,9 +949,13 @@ def run_probe(args):
     print("P0-a Probe Summary")
     print("=" * 60)
 
+    # Token count: either exact match or expected merge ratio
+    token_match = (actual_tokens == expected_tokens) or \
+                  (abs(merger_ratio - spatial_merge_size ** 2) < 0.5)
+
     checks = {
         "Hook capture normal": "shape" in captured_output,
-        "Token count match": abs(actual_tokens - expected_tokens) < 10,
+        "Token count valid (exact or post-merge)": token_match,
         "Replacement affects output": tkey_metrics['js_sum'] > 1e-6,
         "Object region signal stronger": tkey_metrics['ced'] > ctrl_metrics['ced'],
     }
