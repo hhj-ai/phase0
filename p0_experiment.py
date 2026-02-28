@@ -2,6 +2,9 @@
 """
 P0 Experiment: Unified script for Qwen3-VL CED validation
 
+CED formula (per-sample, summed over T_key tokens):
+  CED_i = sum_{t in T_key} [ D_JS(P(·|V) || P(·|V^cf)) + λ_e [H(P^cf) - H(P)]_+ ]
+
 Modes:
   probe   - Architecture probing (single GPU, ~5 minutes)
   worker  - P0-b worker for parallel processing (sharded data)
@@ -49,6 +52,12 @@ COCO_ANN_PATH = f"{BASE}/data/datasets/coco_val2017/annotations/instances_val201
 RESULT_DIR = f"{BASE}/results"
 
 # ============================================================
+# CED Constants
+# ============================================================
+T_KEY_SIZE = 4          # Number of trailing tokens for CED summation
+DEFAULT_LAMBDA_E = 0.1  # Default entropy penalty weight
+
+# ============================================================
 # Utility Functions
 # ============================================================
 
@@ -58,82 +67,133 @@ def _softmax(x):
     e = np.exp(x)
     return e / e.sum()
 
+
 def _to_prob(x):
     p = np.asarray(x, dtype=np.float64)
     p = np.clip(p, 1e-12, None)
     p /= p.sum()
     return p
 
+
 def js_divergence(p, q):
-    """Jensen-Shannon divergence."""
+    """Jensen-Shannon divergence (bits)."""
     p, q = _to_prob(p), _to_prob(q)
     m = 0.5 * (p + q)
     return float(0.5 * entropy(p, m, base=2) + 0.5 * entropy(q, m, base=2))
 
+
 def kl_divergence(p, q):
-    """KL divergence from p to q."""
+    """KL divergence from p to q (bits)."""
     p, q = _to_prob(p), _to_prob(q)
     return float(entropy(p, q, base=2))
+
 
 def shannon_entropy(p):
     """Shannon entropy in bits."""
     return float(entropy(_to_prob(p), base=2))
 
-def get_output_device_dtype(output):
-    """Safely extract device and dtype from model output dataclass.
 
-    Handles various output types from transformers models including
-    BaseModelOutputWithDeepstackFeatures and similar dataclasses.
-    """
-    # Try common tensor attributes in order of preference
+def get_output_device_dtype(output):
+    """Safely extract device and dtype from model output dataclass."""
     for attr_name in ['pooler_output', 'last_hidden_state', 'hidden_states']:
         if hasattr(output, attr_name):
             val = getattr(output, attr_name)
             if val is not None:
                 if attr_name == 'hidden_states' and isinstance(val, (tuple, list)):
-                    # hidden_states is a tuple, use the last layer
                     if len(val) > 0 and torch.is_tensor(val[-1]):
                         return val[-1].device, val[-1].dtype
                 elif torch.is_tensor(val):
                     return val.device, val.dtype
 
-    # Fallback: scan all attributes for the first tensor
     for attr_name in dir(output):
         if not attr_name.startswith('_'):
             try:
                 val = getattr(output, attr_name)
                 if torch.is_tensor(val):
                     return val.device, val.dtype
-            except:
+            except Exception:
                 continue
 
     raise ValueError(f"Cannot find tensor in output of type {type(output)}")
 
-def compute_all_metrics(orig_logits, cf_logits, lambda_e_values=[0.0, 0.05, 0.1, 0.2, 0.5]):
-    """Compute all 6 metric variants."""
-    p = _softmax(orig_logits)
-    q = _softmax(cf_logits)
 
-    js = js_divergence(p, q)
-    kl = kl_divergence(p, q)
-    h_orig = shannon_entropy(p)
-    h_cf = shannon_entropy(q)
-    entropy_penalty = max(0.0, h_cf - h_orig)
+def compute_tkey_ced(orig_logits_tkey, cf_logits_tkey, lambda_e_values):
+    """Compute CED metrics over T_key tokens (per-token JS + entropy penalty, then sum).
+
+    Args:
+        orig_logits_tkey: np.ndarray of shape [T_KEY_SIZE, vocab_size] — original logits.
+        cf_logits_tkey: np.ndarray of shape [T_KEY_SIZE, vocab_size] — counterfactual logits.
+        lambda_e_values: list of lambda_e values to sweep.
+
+    Returns:
+        dict with ced, js_sum, entropy_penalty_sum, avg_ced_per_token, per-lambda variants, etc.
+    """
+    n_tokens = orig_logits_tkey.shape[0]
+    js_per_token = []
+    h_orig_per_token = []
+    h_cf_per_token = []
+    entropy_penalty_per_token = []
+
+    for t in range(n_tokens):
+        p_t = _softmax(orig_logits_tkey[t])
+        q_t = _softmax(cf_logits_tkey[t])
+        js_t = js_divergence(p_t, q_t)
+        h_orig_t = shannon_entropy(p_t)
+        h_cf_t = shannon_entropy(q_t)
+        ep_t = max(0.0, h_cf_t - h_orig_t)
+
+        js_per_token.append(js_t)
+        h_orig_per_token.append(h_orig_t)
+        h_cf_per_token.append(h_cf_t)
+        entropy_penalty_per_token.append(ep_t)
+
+    js_sum = sum(js_per_token)
+    entropy_penalty_sum = sum(entropy_penalty_per_token)
+    h_orig_mean = np.mean(h_orig_per_token)
+    h_cf_mean = np.mean(h_cf_per_token)
 
     result = {
-        "js": js,
-        "kl": kl,
-        "h_orig": h_orig,
-        "h_cf": h_cf,
-        "entropy_penalty": entropy_penalty,
+        "js_sum": js_sum,
+        "entropy_penalty_sum": entropy_penalty_sum,
+        "h_orig": h_orig_mean,
+        "h_cf": h_cf_mean,
     }
 
+    # CED for each lambda: sum over tokens of (js_t + lambda * ep_t)
     for lam in lambda_e_values:
-        result[f"ced_lam{lam:.2f}"] = js + lam * entropy_penalty
-        result[f"ced_abs_lam{lam:.2f}"] = js + lam * abs(h_cf - h_orig)
-        result[f"ced_hcf_lam{lam:.2f}"] = js + lam * h_cf
+        ced_val = sum(js_per_token[t] + lam * entropy_penalty_per_token[t] for t in range(n_tokens))
+        result[f"ced_lam{lam:.2f}"] = ced_val
+        # Absolute entropy difference variant
+        ced_abs_val = sum(
+            js_per_token[t] + lam * abs(h_cf_per_token[t] - h_orig_per_token[t])
+            for t in range(n_tokens)
+        )
+        result[f"ced_abs_lam{lam:.2f}"] = ced_abs_val
+        # H(P^cf) weighting variant
+        ced_hcf_val = sum(
+            js_per_token[t] + lam * h_cf_per_token[t]
+            for t in range(n_tokens)
+        )
+        result[f"ced_hcf_lam{lam:.2f}"] = ced_hcf_val
+
+    # Primary CED with default lambda
+    ced_primary = sum(
+        js_per_token[t] + DEFAULT_LAMBDA_E * entropy_penalty_per_token[t]
+        for t in range(n_tokens)
+    )
+    result["ced"] = ced_primary
+    result["avg_ced_per_token"] = ced_primary / n_tokens
+
+    # Also keep KL sum for comparison
+    kl_sum = 0.0
+    for t in range(n_tokens):
+        p_t = _softmax(orig_logits_tkey[t])
+        q_t = _softmax(cf_logits_tkey[t])
+        kl_sum += kl_divergence(p_t, q_t)
+    result["kl_sum"] = kl_sum
 
     return result
+
 
 def compute_hidden_js(h_orig, h_cf, top_k=4096):
     """JS divergence for hidden states."""
@@ -142,11 +202,13 @@ def compute_hidden_js(h_orig, h_cf, top_k=4096):
     top_dims = np.union1d(np.argsort(np.abs(h1))[-top_k:], np.argsort(np.abs(h2))[-top_k:])
     return js_divergence(_softmax(h1[top_dims]), _softmax(h2[top_dims]))
 
+
 def compute_cosine_dist(h_orig, h_cf):
     """Cosine distance between hidden states."""
     h1 = h_orig.cpu().float().numpy()
     h2 = h_cf.cpu().float().numpy()
     return float(cosine_dist(h1, h2))
+
 
 def safe_auc(labels, scores):
     """Safe AUC calculation."""
@@ -154,12 +216,16 @@ def safe_auc(labels, scores):
         return float("nan")
     return roc_auc_score(labels, scores)
 
+
 # ============================================================
 # Visual Token Hook
 # ============================================================
 
 class VisualTokenHook:
-    """Hook for capturing and modifying visual encoder output."""
+    """Hook for capturing and modifying visual encoder output.
+
+    IMPORTANT: Must be registered on model.visual (Qwen3-VL top-level).
+    """
 
     def __init__(self):
         self.captured = None
@@ -167,7 +233,8 @@ class VisualTokenHook:
         self._handle = None
 
     def register(self, model):
-        self._handle = model.model.visual.register_forward_hook(self._fn)
+        """Register hook on model.visual (NOT model.model.visual)."""
+        self._handle = model.visual.register_forward_hook(self._fn)
         return self
 
     def remove(self):
@@ -183,31 +250,30 @@ class VisualTokenHook:
 
     def _fn(self, module, input, output):
         """Handle dataclass output with pooler_output field."""
-        # Safely get device and dtype from output
         target_device, target_dtype = get_output_device_dtype(output)
 
         if self._modifications is None:
-            # Capture mode: store pooler_output (merger output that goes to LLM)
+            # Capture mode
             if hasattr(output, 'pooler_output') and output.pooler_output is not None:
                 self.captured = output.pooler_output.detach().clone()
             elif hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
                 self.captured = output.last_hidden_state.detach().clone()
             return output
         else:
-            # Replace mode: modify pooler_output and return new dataclass
+            # Replace mode
             if self.captured is None:
                 return output
             mod = self.captured.clone().to(device=target_device, dtype=target_dtype)
             for idx, val in self._modifications.items():
                 if 0 <= idx < mod.shape[0]:
                     mod[idx] = val.to(device=mod.device, dtype=mod.dtype)
-            # Return modified dataclass
             out_copy = copy(output)
             if hasattr(output, 'pooler_output'):
                 out_copy.pooler_output = mod
             elif hasattr(output, 'last_hidden_state'):
                 out_copy.last_hidden_state = mod
             return out_copy
+
 
 # ============================================================
 # Data Loading
@@ -227,6 +293,7 @@ ATTRIBUTE_MAP = {
     "fire hydrant": ("Is the fire hydrant red?", None),
     "stop sign": ("Is there a red stop sign?", None),
 }
+
 
 def load_samples(ann_path: str, img_dir: str, n_samples: int = 400,
                  min_bbox_ratio: float = 0.02, seed: int = 42) -> List[Dict]:
@@ -317,9 +384,9 @@ def load_samples(ann_path: str, img_dir: str, n_samples: int = 400,
     print(f"Loaded {len(samples)} samples: {dict(task_counts)}")
     return samples
 
+
 def bbox_to_indices(bbox, img_w, img_h, grid_h, grid_w, spatial_merge_size=2, debug=False):
     """Map bbox coordinates to visual token indices (using merged grid)."""
-    # Use merged grid dimensions (after spatial merge)
     merged_h = grid_h // spatial_merge_size
     merged_w = grid_w // spatial_merge_size
 
@@ -331,15 +398,15 @@ def bbox_to_indices(bbox, img_w, img_h, grid_h, grid_w, spatial_merge_size=2, de
     indices = [r * merged_w + c for r in range(row_start, row_end) for c in range(col_start, col_end)]
 
     if debug:
-        print(f"  [bbox映射] 图像({img_w}x{img_h}px) -> Grid({grid_w}x{grid_h} / merge={spatial_merge_size} -> {merged_w}x{merged_h})")
-        print(f"  [bbox映射] bbox({x:.0f},{y:.0f},{w:.0f},{h:.0f}px) -> tokens[{col_start}:{col_end}, {row_start}:{row_end}]")
-        print(f"  [bbox映射] 共{len(indices)}个tokens ({len(indices)/(merged_h*merged_w)*100:.1f}%)")
+        print(f"  [bbox] img({img_w}x{img_h}px) -> Grid({grid_w}x{grid_h} / merge={spatial_merge_size} -> {merged_w}x{merged_h})")
+        print(f"  [bbox] bbox({x:.0f},{y:.0f},{w:.0f},{h:.0f}px) -> tokens[{col_start}:{col_end}, {row_start}:{row_end}]")
+        print(f"  [bbox] {len(indices)} tokens ({len(indices)/(merged_h*merged_w)*100:.1f}%)")
 
     return indices
 
+
 def get_control_indices(all_bboxes, img_w, img_h, grid_h, grid_w, n, spatial_merge_size=2):
     """Get control region indices (unoccupied by any bbox)."""
-    # Use merged grid dimensions
     merged_grid_h = grid_h // spatial_merge_size
     merged_grid_w = grid_w // spatial_merge_size
     occupied = set()
@@ -350,6 +417,7 @@ def get_control_indices(all_bboxes, img_w, img_h, grid_h, grid_w, n, spatial_mer
         start = random.randint(0, len(free) - n)
         return free[start:start+n]
     return free if free else list(range(min(n, merged_grid_h * merged_grid_w)))
+
 
 # ============================================================
 # Model Interaction
@@ -382,8 +450,18 @@ def get_model_answer(model, processor, image, question, device):
     else:
         return -1, answer_text
 
-def process_sample(sample, model, processor, hook, device, layers, lambda_e_values, spatial_merge_size=2):
-    """Process a single sample through CED pipeline."""
+
+def process_sample(sample, model, processor, hook, device, layers,
+                   lambda_e_values, spatial_merge_size=2, t_key_size=T_KEY_SIZE):
+    """Process a single sample through CED pipeline.
+
+    Core logic:
+      1. Get model answer (generate)
+      2. Original forward → capture visual features + logits
+      3. Replace object-region visual tokens → counterfactual forward
+      4. For last t_key_size tokens: per-token JS + entropy penalty, then SUM
+      5. Optionally compute control group (for correct_positive)
+    """
     from qwen_vl_utils import process_vision_info
 
     try:
@@ -409,7 +487,7 @@ def process_sample(sample, model, processor, hook, device, layers, lambda_e_valu
     else:
         return None
 
-    # Step 2: Construct inputs for CED (no generation, just logits)
+    # Step 2: Construct inputs for CED (logits, no generation)
     messages = [{"role": "user", "content": [
         {"type": "image", "image": image},
         {"type": "text", "text": sample["question"]},
@@ -426,7 +504,7 @@ def process_sample(sample, model, processor, hook, device, layers, lambda_e_valu
     grid_h = grid_thw[0, 1].item()
     grid_w = grid_thw[0, 2].item()
 
-    # Step 3: Original forward (capture)
+    # Step 3: Original forward (capture visual features)
     hook.reset()
     with torch.no_grad():
         orig_out = model(**inputs, output_hidden_states=True, return_dict=True)
@@ -450,18 +528,22 @@ def process_sample(sample, model, processor, hook, device, layers, lambda_e_valu
         cf_out = model(**inputs, output_hidden_states=True, return_dict=True)
     hook.reset()
 
-    # Step 5: Compute all metrics
-    orig_logits = orig_out.logits[0, -1].cpu().float().numpy()
-    cf_logits = cf_out.logits[0, -1].cpu().float().numpy()
+    # Step 5: Compute T_key CED (last t_key_size tokens, per-token then sum)
+    seq_len = orig_out.logits.shape[1]
+    actual_tkey = min(t_key_size, seq_len)
 
-    metrics = compute_all_metrics(orig_logits, cf_logits, lambda_e_values)
+    # Extract logits for last actual_tkey tokens: shape [actual_tkey, vocab_size]
+    orig_logits_tkey = orig_out.logits[0, -actual_tkey:].cpu().float().numpy()
+    cf_logits_tkey = cf_out.logits[0, -actual_tkey:].cpu().float().numpy()
 
-    # Cosine distance
+    metrics = compute_tkey_ced(orig_logits_tkey, cf_logits_tkey, lambda_e_values)
+
+    # Cosine distance (last hidden state, last token)
     h_orig_last = orig_out.hidden_states[-1][0, -1]
     h_cf_last = cf_out.hidden_states[-1][0, -1]
     metrics["cosine_dist"] = compute_cosine_dist(h_orig_last, h_cf_last)
 
-    # Hidden layers
+    # Hidden layer JS (last token)
     for layer in layers:
         if layer < len(orig_out.hidden_states):
             metrics[f"layer_{layer}_js"] = compute_hidden_js(
@@ -478,6 +560,7 @@ def process_sample(sample, model, processor, hook, device, layers, lambda_e_valu
         "behavior": behavior,
         "n_target_tokens": len(target_idx),
         "n_total_tokens": grid_h * grid_w,
+        "t_key_size": actual_tkey,
         **metrics,
     }
 
@@ -489,6 +572,7 @@ def process_sample(sample, model, processor, hook, device, layers, lambda_e_valu
         surr_ctrl = sorted(set(range(vis_feat.shape[0])) - set(ctrl_idx))
         repl_ctrl = vis_feat[surr_ctrl].mean(0) if surr_ctrl else vis_feat.mean(0)
 
+        # Need a fresh capture for control forward
         hook.reset()
         with torch.no_grad():
             _ = model(**inputs, output_hidden_states=False, return_dict=True)
@@ -498,13 +582,16 @@ def process_sample(sample, model, processor, hook, device, layers, lambda_e_valu
             ctrl_out = model(**inputs, output_hidden_states=False, return_dict=True)
         hook.reset()
 
-        ctrl_logits = ctrl_out.logits[0, -1].cpu().float().numpy()
-        ctrl_metrics = compute_all_metrics(orig_logits, ctrl_logits, lambda_e_values)
-        result["ctrl_js"] = ctrl_metrics["js"]
+        # Control T_key CED
+        ctrl_logits_tkey = ctrl_out.logits[0, -actual_tkey:].cpu().float().numpy()
+        ctrl_metrics = compute_tkey_ced(orig_logits_tkey, ctrl_logits_tkey, lambda_e_values)
+        result["ctrl_ced"] = ctrl_metrics["ced"]
+        result["ctrl_js_sum"] = ctrl_metrics["js_sum"]
         for lam in lambda_e_values:
             result[f"ctrl_ced_lam{lam:.2f}"] = ctrl_metrics[f"ced_lam{lam:.2f}"]
 
     return result
+
 
 # ============================================================
 # Mode: Probe
@@ -529,32 +616,35 @@ def run_probe(args):
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
-    print(f"\nmodel.model.visual type: {type(model.model.visual).__name__}")
-    if hasattr(model.model.visual, 'merger'):
-        print(f"model.model.visual.merger type: {type(model.model.visual.merger).__name__}")
+    # NOTE: Hook is on model.visual, not model.model.visual
+    print(f"\nmodel.visual type: {type(model.visual).__name__}")
+    if hasattr(model.visual, 'merger'):
+        print(f"model.visual.merger type: {type(model.visual.merger).__name__}")
 
     # Architecture parameter detection
     print("\n--- Architecture Parameters ---")
-    spatial_merge_size = getattr(model.model.visual, 'spatial_merge_size', None)
-    if spatial_merge_size is None and hasattr(model.model.visual, 'config'):
-        spatial_merge_size = getattr(model.model.visual.config, 'spatial_merge_size', None)
+    spatial_merge_size = getattr(model.visual, 'spatial_merge_size', None)
+    if spatial_merge_size is None and hasattr(model.visual, 'config'):
+        spatial_merge_size = getattr(model.visual.config, 'spatial_merge_size', None)
     if spatial_merge_size is None:
         spatial_merge_size = 2
         print(f"  spatial_merge_size: not detected, using default {spatial_merge_size}")
     else:
         print(f"  spatial_merge_size: {spatial_merge_size} (merges {spatial_merge_size}x{spatial_merge_size} patches per token)")
 
-    patch_size = getattr(model.model.visual, 'patch_size', None)
-    if patch_size is None and hasattr(model.model.visual, 'config'):
-        patch_size = getattr(model.model.visual.config, 'patch_size', None)
+    patch_size = getattr(model.visual, 'patch_size', None)
+    if patch_size is None and hasattr(model.visual, 'config'):
+        patch_size = getattr(model.visual.config, 'patch_size', None)
     if patch_size is None:
         patch_size = 14
         print(f"  patch_size: not detected, using default {patch_size}")
     else:
         print(f"  patch_size: {patch_size}")
 
-    vis_params = sum(p.numel() for p in model.model.visual.parameters())
+    vis_params = sum(p.numel() for p in model.visual.parameters())
     print(f"\nVisual encoder parameters: {vis_params / 1e6:.1f}M")
+
+    print(f"\nCED config: T_KEY_SIZE={T_KEY_SIZE}, DEFAULT_LAMBDA_E={DEFAULT_LAMBDA_E}")
 
     # Step 2: Single image forward pass
     print("\n--- Step 2: Single Image Forward Pass ---")
@@ -614,19 +704,23 @@ def run_probe(args):
         print("WARNING: image_grid_thw not found!")
         sys.exit(1)
 
-    # Step 3: Hook test
+    # Step 3: Hook test — registered on model.visual
     print("\n--- Step 3: Hook Mechanism Test ---")
 
     captured_output = {}
 
     def capture_hook(module, input, output):
-        # output is a dataclass with pooler_output field
-        captured_output["shape"] = output.pooler_output.shape
-        captured_output["dtype"] = output.pooler_output.dtype
-        captured_output["tensor"] = output.pooler_output.detach().clone()
+        if hasattr(output, 'pooler_output') and output.pooler_output is not None:
+            captured_output["shape"] = output.pooler_output.shape
+            captured_output["dtype"] = output.pooler_output.dtype
+            captured_output["tensor"] = output.pooler_output.detach().clone()
+        elif hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
+            captured_output["shape"] = output.last_hidden_state.shape
+            captured_output["dtype"] = output.last_hidden_state.dtype
+            captured_output["tensor"] = output.last_hidden_state.detach().clone()
         return output
 
-    handle = model.model.visual.register_forward_hook(capture_hook)
+    handle = model.visual.register_forward_hook(capture_hook)
 
     with torch.no_grad():
         orig_out = model(**inputs, output_hidden_states=True, return_dict=True)
@@ -648,11 +742,11 @@ def run_probe(args):
     print(f"Actual visual tokens: {actual_tokens} (from hook output)")
 
     if actual_tokens == expected_tokens:
-        print("✅ Visual token count matches!")
+        print("OK: Visual token count matches!")
         merger_ratio = 1
     else:
         ratio = expected_tokens / actual_tokens if actual_tokens > 0 else 0
-        print(f"⚠️  Mismatch! Ratio = {ratio:.1f}")
+        print(f"Mismatch! Ratio = {ratio:.1f}")
         merger_ratio = ratio
 
     hidden_dim = vis_shape[-1]
@@ -661,14 +755,10 @@ def run_probe(args):
     # Step 4: Replacement test
     print("\n--- Step 4: Replacement Test ---")
 
-    # Calculate spatial_merge_size from merger_ratio (e.g., ratio=4 means spatial_merge_size=2)
     spatial_merge_size = int(np.sqrt(merger_ratio)) if merger_ratio > 1 else 2
-
-    # Calculate merged grid dimensions (actual visual token grid after spatial merge)
     merged_grid_h = grid_h // spatial_merge_size
     merged_grid_w = grid_w // spatial_merge_size
 
-    # Calculate target token indices using merged grid dimensions
     col_start = int(bbox[0] / img_w * merged_grid_w)
     col_end = int(np.ceil((bbox[0] + bbox[2]) / img_w * merged_grid_w))
     row_start = int(bbox[1] / img_h * merged_grid_h)
@@ -683,22 +773,16 @@ def run_probe(args):
         for c in range(col_start, col_end):
             target_indices.append(r * merged_grid_w + c)
 
-    # Enhanced bbox mapping logs
     print(f"\n--- BBox Mapping Validation ---")
     print(f"  Image size: {img_w} x {img_h} pixels")
     print(f"  Original grid: {grid_w} x {grid_h} tokens")
     print(f"  Spatial merge size: {spatial_merge_size}")
     print(f"  Merged grid: {merged_grid_w} x {merged_grid_h} tokens (actual visual tokens)")
     print(f"  BBox (xywh): [{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]")
-    print(f"  BBox center: ({bbox[0] + bbox[2]/2:.1f}, {bbox[1] + bbox[3]/2:.1f})")
     print(f"  Mapped token range: cols [{col_start}, {col_end}), rows [{row_start}, {row_end})")
-    token_center_x = (col_start + col_end) / 2
-    token_center_y = (row_start + row_end) / 2
-    print(f"  Mapped token center: ({token_center_x:.1f}, {token_center_y:.1f})")
     print(f"  Target tokens: {len(target_indices)} / {merged_grid_h * merged_grid_w} total")
     print(f"  Target region ratio: {len(target_indices) / (merged_grid_h * merged_grid_w) * 100:.1f}%")
 
-    # Compute replacement value
     vis_features = captured_output["tensor"]
     all_indices = set(range(vis_features.shape[0]))
     surr_indices = sorted(all_indices - set(target_indices))
@@ -707,7 +791,6 @@ def run_probe(args):
     else:
         replacement = vis_features.mean(dim=0)
 
-    # Modified version
     modified_features = vis_features.clone()
     for idx in target_indices:
         if idx < modified_features.shape[0]:
@@ -722,41 +805,39 @@ def run_probe(args):
             out.last_hidden_state = modified_features.to(device=target_device, dtype=target_dtype)
         return out
 
-    handle2 = model.model.visual.register_forward_hook(replace_hook)
+    handle2 = model.visual.register_forward_hook(replace_hook)
     with torch.no_grad():
         cf_out = model(**inputs, output_hidden_states=True, return_dict=True)
     handle2.remove()
 
-    # Compare logits
-    orig_logits = orig_out.logits[0, -1].cpu().float()
-    cf_logits = cf_out.logits[0, -1].cpu().float()
-    logit_diff = (orig_logits - cf_logits).abs().mean().item()
-    logit_max_diff = (orig_logits - cf_logits).abs().max().item()
+    # T_key logits comparison
+    seq_len = orig_out.logits.shape[1]
+    actual_tkey = min(T_KEY_SIZE, seq_len)
+    orig_logits_tkey = orig_out.logits[0, -actual_tkey:].cpu().float().numpy()
+    cf_logits_tkey = cf_out.logits[0, -actual_tkey:].cpu().float().numpy()
 
-    # JS divergence
-    p = torch.softmax(orig_logits, dim=0).numpy()
-    q = torch.softmax(cf_logits, dim=0).numpy()
-    p = np.clip(p, 1e-12, None); p /= p.sum()
-    q = np.clip(q, 1e-12, None); q /= q.sum()
-    m = 0.5 * (p + q)
-    js = 0.5 * entropy(p, m, base=2) + 0.5 * entropy(q, m, base=2)
+    tkey_metrics = compute_tkey_ced(orig_logits_tkey, cf_logits_tkey, [DEFAULT_LAMBDA_E])
 
-    print(f"\nLogits difference after replacement:")
-    print(f"  Mean |Δlogits|: {logit_diff:.4f}")
-    print(f"  Max  |Δlogits|: {logit_max_diff:.4f}")
-    print(f"  JS divergence:  {js:.6f}")
+    # Also compute single last-token JS for comparison
+    p_last = _softmax(orig_logits_tkey[-1])
+    q_last = _softmax(cf_logits_tkey[-1])
+    js_last = js_divergence(p_last, q_last)
 
-    if js > 1e-6:
-        print("✅ Replacing visual tokens affects output! JS > 0")
+    print(f"\nT_key CED (last {actual_tkey} tokens, lambda={DEFAULT_LAMBDA_E}):")
+    print(f"  ced (sum):         {tkey_metrics['ced']:.6f}")
+    print(f"  js_sum:            {tkey_metrics['js_sum']:.6f}")
+    print(f"  entropy_penalty:   {tkey_metrics['entropy_penalty_sum']:.6f}")
+    print(f"  avg_ced_per_token: {tkey_metrics['avg_ced_per_token']:.6f}")
+    print(f"  (last-token-only JS for ref: {js_last:.6f})")
+
+    if tkey_metrics['js_sum'] > 1e-6:
+        print("OK: Replacing visual tokens affects output! JS_sum > 0")
     else:
-        print("❌ FAIL: Output barely changed after replacement")
+        print("FAIL: Output barely changed after replacement")
 
     # Step 5: Control experiment
     print("\n--- Step 5: Control Comparison ---")
 
-    # Use merged grid for corner indices
-    merged_grid_h = grid_h // spatial_merge_size
-    merged_grid_w = grid_w // spatial_merge_size
     corner_indices = []
     for r in range(min(2, merged_grid_h)):
         for c in range(min(2, merged_grid_w)):
@@ -779,23 +860,20 @@ def run_probe(args):
             out_copy.last_hidden_state = ctrl_features.to(device=target_device, dtype=target_dtype)
         return out_copy
 
-    handle3 = model.model.visual.register_forward_hook(ctrl_hook)
+    handle3 = model.visual.register_forward_hook(ctrl_hook)
     with torch.no_grad():
         ctrl_out = model(**inputs, output_hidden_states=True, return_dict=True)
     handle3.remove()
 
-    ctrl_logits = ctrl_out.logits[0, -1].cpu().float()
-    p_ctrl = torch.softmax(ctrl_logits, dim=0).numpy()
-    p_ctrl = np.clip(p_ctrl, 1e-12, None); p_ctrl /= p_ctrl.sum()
-    m_ctrl = 0.5 * (p + p_ctrl)
-    js_ctrl = 0.5 * entropy(p, m_ctrl, base=2) + 0.5 * entropy(p_ctrl, m_ctrl, base=2)
+    ctrl_logits_tkey = ctrl_out.logits[0, -actual_tkey:].cpu().float().numpy()
+    ctrl_metrics = compute_tkey_ced(orig_logits_tkey, ctrl_logits_tkey, [DEFAULT_LAMBDA_E])
 
-    print(f"Object region JS = {js:.6f}")
-    print(f"Corner region JS = {js_ctrl:.6f}")
-    if js > js_ctrl:
-        print(f"✅ Object region JS > Corner region JS (ratio: {js/max(js_ctrl, 1e-12):.1f}x)")
+    print(f"Object region CED = {tkey_metrics['ced']:.6f} (js_sum={tkey_metrics['js_sum']:.6f})")
+    print(f"Corner region CED = {ctrl_metrics['ced']:.6f} (js_sum={ctrl_metrics['js_sum']:.6f})")
+    if tkey_metrics['ced'] > ctrl_metrics['ced']:
+        print(f"OK: Object region CED > Corner region CED (ratio: {tkey_metrics['ced']/max(ctrl_metrics['ced'], 1e-12):.1f}x)")
     else:
-        print(f"⚠️  Corner region JS >= Object region JS, signal may be weak")
+        print(f"Warning: Corner region CED >= Object region CED, signal may be weak")
 
     # Step 6: Hidden states check
     print("\n--- Step 6: Hidden States Structure ---")
@@ -804,10 +882,10 @@ def run_probe(args):
     print(f"Available intermediate layers: 0 to {n_layers-1}")
     print(f"Planned probes: [16, 20, 24, 28, 32]", end=" ")
     if n_layers > 32:
-        print("✅ All within range")
+        print("OK: All within range")
     else:
         safe_layers = [l for l in [16, 20, 24, 28, 32] if l < n_layers]
-        print(f"⚠️  Actually available: {safe_layers}")
+        print(f"Actually available: {safe_layers}")
 
     # Summary
     print("\n" + "=" * 60)
@@ -817,14 +895,14 @@ def run_probe(args):
     checks = {
         "Hook capture normal": "shape" in captured_output,
         "Token count match": abs(actual_tokens - expected_tokens) < 10,
-        "Replacement affects output": js > 1e-6,
-        "Object region signal stronger": js > js_ctrl,
+        "Replacement affects output": tkey_metrics['js_sum'] > 1e-6,
+        "Object region signal stronger": tkey_metrics['ced'] > ctrl_metrics['ced'],
     }
 
     all_pass = True
     for name, passed in checks.items():
-        status = "✅" if passed else "❌"
-        print(f"  {status} {name}")
+        status = "PASS" if passed else "FAIL"
+        print(f"  [{status}] {name}")
         if not passed:
             all_pass = False
 
@@ -840,10 +918,14 @@ def run_probe(args):
         "hidden_dim": hidden_dim,
         "n_hidden_layers": n_layers,
         "visual_output_shape": list(vis_shape),
-        "js_object_region": float(js),
-        "js_control_region": float(js_ctrl),
+        "js_sum_object_region": float(tkey_metrics['js_sum']),
+        "js_sum_control_region": float(ctrl_metrics['js_sum']),
+        "ced_object_region": float(tkey_metrics['ced']),
+        "ced_control_region": float(ctrl_metrics['ced']),
         "spatial_merge_size": spatial_merge_size,
         "patch_size": patch_size,
+        "t_key_size": T_KEY_SIZE,
+        "default_lambda_e": DEFAULT_LAMBDA_E,
         "all_passed": all_pass,
     }
     os.makedirs(RESULT_DIR, exist_ok=True)
@@ -852,6 +934,7 @@ def run_probe(args):
     print(f"\nProbe info saved to {RESULT_DIR}/p0a_probe_info.json")
 
     return probe_info
+
 
 # ============================================================
 # Mode: Worker
@@ -862,7 +945,8 @@ def run_worker(args):
     print("=" * 60)
     print(f"P0-b Worker: Shard {args.shard_idx}/{args.num_shards}")
     print("=" * 60)
-    print(f"Pass criterion: correct_positive vs hallucination AUC > 0.85\n")
+    print(f"CED config: T_KEY_SIZE={T_KEY_SIZE}, DEFAULT_LAMBDA_E={DEFAULT_LAMBDA_E}")
+    print(f"Pass criterion: correct_positive vs hallucination AUC(ced) > 0.85\n")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -911,7 +995,7 @@ def run_worker(args):
             results.append(r)
             behavior_counts[r["behavior"]] += 1
 
-        # Real-time progress
+        # Real-time progress — use "ced" as primary metric
         if len(results) % 50 == 0 and len(results) > 0:
             df_t = pd.DataFrame(results)
             cp = df_t[df_t["behavior"] == "correct_positive"]
@@ -919,9 +1003,10 @@ def run_worker(args):
             if len(cp) > 5 and len(hal) > 5:
                 sub = pd.concat([cp, hal])
                 labels = (sub["behavior"] == "correct_positive").astype(int)
-                auc = roc_auc_score(labels, sub["js"])
+                auc_ced = roc_auc_score(labels, sub["ced"])
+                auc_js = roc_auc_score(labels, sub["js_sum"])
                 tqdm.write(f"  n={len(results)}, behaviors={dict(behavior_counts)}, "
-                          f"cp_vs_hal AUC(js)={auc:.3f}")
+                          f"cp_vs_hal AUC(ced)={auc_ced:.3f} AUC(js_sum)={auc_js:.3f}")
 
     # Save shard results
     os.makedirs(args.output_dir, exist_ok=True)
@@ -933,6 +1018,7 @@ def run_worker(args):
 
     hook.remove()
     return df
+
 
 # ============================================================
 # Mode: Analyze
@@ -982,8 +1068,9 @@ def run_analyze(args):
     analyze_results(df, args.lambda_e_values, args.layers)
     plot_results(df, args.lambda_e_values, args.layers, args.result_dir)
 
+
 def analyze_results(df, lambda_e_values, layers):
-    """Analyze merged results."""
+    """Analyze merged results — AUC primarily on 'ced' (label vs ced)."""
     print("\n" + "=" * 60)
     print("P0-b Results Analysis")
     print("=" * 60)
@@ -993,7 +1080,9 @@ def analyze_results(df, lambda_e_values, layers):
     for b in ["correct_positive", "hallucination", "correct_negative", "miss"]:
         sub = df[df["behavior"] == b]
         if len(sub) > 0:
-            print(f"  {b:20s}: n={len(sub):4d}, JS={sub['js'].mean():.4f}±{sub['js'].std():.4f}")
+            ced_col = "ced" if "ced" in sub.columns else "js_sum"
+            print(f"  {b:20s}: n={len(sub):4d}, CED={sub[ced_col].mean():.4f}+-{sub[ced_col].std():.4f}, "
+                  f"JS_sum={sub['js_sum'].mean():.4f}+-{sub['js_sum'].std():.4f}")
 
     # 2. Core AUC: correct_positive vs hallucination
     print("\n--- Core AUC: correct_positive vs hallucination ---")
@@ -1009,7 +1098,7 @@ def analyze_results(df, lambda_e_values, layers):
         print("\n--- Fallback: gt=1 vs gt=0 ---")
         labels = df["gt"]
         if labels.nunique() > 1:
-            for metric in ["js"] + [f"ced_lam{l:.2f}" for l in lambda_e_values]:
+            for metric in ["ced", "js_sum"] + [f"ced_lam{l:.2f}" for l in lambda_e_values]:
                 if metric in df.columns:
                     auc = safe_auc(labels, df[metric])
                     print(f"  {metric:25s}: AUC = {auc:.4f}")
@@ -1017,51 +1106,67 @@ def analyze_results(df, lambda_e_values, layers):
 
     sub = pd.concat([cp.assign(label=1), hal.assign(label=0)])
 
-    print("\n  [Logits Layer]")
+    print(f"\n  Samples: cp={len(cp)}, hal={len(hal)}, total={len(sub)}")
+    print(f"\n  [Primary: CED (sum over T_key={T_KEY_SIZE} tokens)]")
 
-    # A: Raw JS
-    auc_js = safe_auc(sub["label"], sub["js"])
-    print(f"  A. Raw JS divergence:      AUC = {auc_js:.4f}")
+    # A: Primary CED (sum, default lambda)
+    auc_ced = safe_auc(sub["label"], sub["ced"])
+    print(f"  A. CED (lambda={DEFAULT_LAMBDA_E}):    AUC = {auc_ced:.4f}  <-- PRIMARY")
 
-    # B: CED variants
-    best_auc, best_config = auc_js, "js"
+    # B: Raw JS sum
+    auc_js = safe_auc(sub["label"], sub["js_sum"])
+    print(f"  B. JS_sum (no penalty):     AUC = {auc_js:.4f}")
+
+    # C: CED lambda sweep
+    best_auc, best_config = auc_ced, f"ced (lambda={DEFAULT_LAMBDA_E})"
+    print(f"\n  [Lambda Sweep]")
     for lam in lambda_e_values:
         col = f"ced_lam{lam:.2f}"
         if col in sub.columns:
             auc = safe_auc(sub["label"], sub[col])
-            tag = " ★" if auc > best_auc else ""
-            print(f"  B. CED(λ={lam:.2f}):           AUC = {auc:.4f}{tag}")
+            tag = " *" if auc > best_auc else ""
+            print(f"  CED(lambda={lam:.2f}):           AUC = {auc:.4f}{tag}")
             if auc > best_auc:
                 best_auc, best_config = auc, col
 
-    # C: ced_hcf
+    # D: avg_ced_per_token
+    if "avg_ced_per_token" in sub.columns:
+        auc_avg = safe_auc(sub["label"], sub["avg_ced_per_token"])
+        print(f"\n  avg_ced_per_token:           AUC = {auc_avg:.4f}")
+
+    # E: ced_hcf variant
     for lam in [0.1]:
         col = f"ced_hcf_lam{lam:.2f}"
         if col in sub.columns:
             auc = safe_auc(sub["label"], sub[col])
-            print(f"  C. JS+λH(P^cf) (λ={lam:.2f}): AUC = {auc:.4f}")
+            print(f"  JS+lambda*H(P^cf) ({lam:.2f}):   AUC = {auc:.4f}")
+            if auc > best_auc:
+                best_auc, best_config = auc, col
 
-    # D: ced_abs
+    # F: ced_abs variant
     for lam in [0.1]:
         col = f"ced_abs_lam{lam:.2f}"
         if col in sub.columns:
             auc = safe_auc(sub["label"], sub[col])
-            print(f"  D. JS+λ|ΔH| (λ={lam:.2f}):    AUC = {auc:.4f}")
+            print(f"  JS+lambda*|dH| ({lam:.2f}):      AUC = {auc:.4f}")
+            if auc > best_auc:
+                best_auc, best_config = auc, col
 
-    # E: KL
-    auc_kl = safe_auc(sub["label"], sub["kl"])
-    print(f"  E. KL(P||P^cf):            AUC = {auc_kl:.4f}")
-    if auc_kl > best_auc:
-        best_auc, best_config = auc_kl, "kl"
+    # G: KL sum
+    if "kl_sum" in sub.columns:
+        auc_kl = safe_auc(sub["label"], sub["kl_sum"])
+        print(f"  KL_sum(P||P^cf):            AUC = {auc_kl:.4f}")
+        if auc_kl > best_auc:
+            best_auc, best_config = auc_kl, "kl_sum"
 
-    # F: Cosine
+    # H: Cosine
     if "cosine_dist" in sub.columns:
         auc_cos = safe_auc(sub["label"], sub["cosine_dist"])
-        print(f"  F. Cosine distance:        AUC = {auc_cos:.4f}")
+        print(f"  Cosine distance:            AUC = {auc_cos:.4f}")
         if auc_cos > best_auc:
             best_auc, best_config = auc_cos, "cosine_dist"
 
-    print(f"\n  → Best: {best_config}, AUC = {best_auc:.4f}")
+    print(f"\n  -> Best: {best_config}, AUC = {best_auc:.4f}")
 
     # 3. Intermediate layers
     print("\n  [Intermediate Layers]")
@@ -1079,19 +1184,24 @@ def analyze_results(df, lambda_e_values, layers):
         hal_t = task_sub[task_sub["behavior"] == "hallucination"]
         if len(cp_t) >= 3 and len(hal_t) >= 3:
             s = pd.concat([cp_t.assign(label=1), hal_t.assign(label=0)])
-            auc = safe_auc(s["label"], s["js"])
-            print(f"  {task:12s}: AUC = {auc:.4f} (cp={len(cp_t)}, hal={len(hal_t)})")
+            auc = safe_auc(s["label"], s["ced"])
+            print(f"  {task:12s}: AUC(ced) = {auc:.4f} (cp={len(cp_t)}, hal={len(hal_t)})")
         else:
             print(f"  {task:12s}: insufficient samples (cp={len(cp_t)}, hal={len(hal_t)})")
 
     # 5. Control group comparison
     print("\n--- Control Group (correct_positive only) ---")
-    ctrl_rows = cp[cp["ctrl_js"].notna()] if "ctrl_js" in cp.columns else pd.DataFrame()
-    if len(ctrl_rows) > 0:
-        print(f"  Object region JS:     {ctrl_rows['js'].mean():.4f} ± {ctrl_rows['js'].std():.4f}")
-        print(f"  Non-object region JS: {ctrl_rows['ctrl_js'].mean():.4f} ± {ctrl_rows['ctrl_js'].std():.4f}")
-        ratio = ctrl_rows['js'].mean() / max(ctrl_rows['ctrl_js'].mean(), 1e-8)
+    ctrl_col = "ctrl_ced" if "ctrl_ced" in cp.columns else None
+    if ctrl_col and cp[ctrl_col].notna().sum() > 0:
+        ctrl_rows = cp[cp[ctrl_col].notna()]
+        print(f"  Object region CED:     {ctrl_rows['ced'].mean():.4f} +- {ctrl_rows['ced'].std():.4f}")
+        print(f"  Non-object region CED: {ctrl_rows[ctrl_col].mean():.4f} +- {ctrl_rows[ctrl_col].std():.4f}")
+        ratio = ctrl_rows['ced'].mean() / max(ctrl_rows[ctrl_col].mean(), 1e-8)
         print(f"  Ratio: {ratio:.1f}x")
+    if "ctrl_js_sum" in cp.columns and cp["ctrl_js_sum"].notna().sum() > 0:
+        ctrl_js_rows = cp[cp["ctrl_js_sum"].notna()]
+        print(f"  Object region JS_sum:     {ctrl_js_rows['js_sum'].mean():.4f} +- {ctrl_js_rows['js_sum'].std():.4f}")
+        print(f"  Non-object region JS_sum: {ctrl_js_rows['ctrl_js_sum'].mean():.4f} +- {ctrl_js_rows['ctrl_js_sum'].std():.4f}")
 
     # 6. Entropy analysis
     print("\n--- Entropy Analysis ---")
@@ -1100,20 +1210,21 @@ def analyze_results(df, lambda_e_values, layers):
         if len(s) > 0:
             print(f"  {b:20s}: H(P)={s['h_orig'].mean():.3f}, "
                   f"H(P^cf)={s['h_cf'].mean():.3f}, "
-                  f"Δ_+={s['entropy_penalty'].mean():.4f}")
+                  f"ep_sum={s['entropy_penalty_sum'].mean():.4f}")
 
     # 7. Pass/Fail
     print("\n" + "=" * 60)
     if best_auc > 0.85:
-        print(f"✅ P0-b PASSED: AUC = {best_auc:.4f} > 0.85 ({best_config})")
-        print(f"   → Proceed to Phase 1 GRPO!")
+        print(f"P0-b PASSED: AUC = {best_auc:.4f} > 0.85 ({best_config})")
+        print(f"   -> Proceed to Phase 1 GRPO!")
     elif best_auc > 0.75:
-        print(f"⚠️  P0-b MARGINAL: AUC = {best_auc:.4f}")
+        print(f"P0-b MARGINAL: AUC = {best_auc:.4f}")
         print(f"   Suggestion: Adjust token replacement strategy or increase samples")
     else:
-        print(f"❌ P0-b FAILED: AUC = {best_auc:.4f}")
+        print(f"P0-b FAILED: AUC = {best_auc:.4f}")
         print(f"   Suggestion: Switch to VCD noise/MaskCD/PROJECTAWAY")
     print("=" * 60)
+
 
 def plot_results(df, lambda_e_values, layers, result_dir):
     """Generate visualization plots."""
@@ -1124,29 +1235,33 @@ def plot_results(df, lambda_e_values, layers, result_dir):
     hal = df[df["behavior"] == "hallucination"]
     sub = pd.concat([cp.assign(label=1), hal.assign(label=0)]) if len(cp) > 0 and len(hal) > 0 else pd.DataFrame()
 
-    # 1. JS distribution by behavior
+    primary_metric = "ced"
+
+    # 1. CED distribution by behavior
     ax = axes[0, 0]
     colors = {"correct_positive": "green", "hallucination": "red",
               "correct_negative": "blue", "miss": "orange"}
     for b, c in colors.items():
         s = df[df["behavior"] == b]
-        if len(s) > 2:
-            ax.hist(s["js"], bins=25, alpha=0.4, color=c, label=f"{b} (n={len(s)})", density=True)
-    ax.set_xlabel("JS Divergence")
-    ax.set_title("JS Distribution by Behavior")
+        if len(s) > 2 and primary_metric in s.columns:
+            ax.hist(s[primary_metric], bins=25, alpha=0.4, color=c, label=f"{b} (n={len(s)})", density=True)
+    ax.set_xlabel(f"CED (T_key={T_KEY_SIZE}, lambda={DEFAULT_LAMBDA_E})")
+    ax.set_title("CED Distribution by Behavior")
     ax.legend(fontsize=8)
 
     # 2. Formula ablation AUC
     ax = axes[0, 1]
     if len(sub) > 0 and sub["label"].nunique() > 1:
         names, aucs = [], []
-        names.append("JS"); aucs.append(safe_auc(sub["label"], sub["js"]))
+        names.append("CED (primary)"); aucs.append(safe_auc(sub["label"], sub["ced"]))
+        names.append("JS_sum"); aucs.append(safe_auc(sub["label"], sub["js_sum"]))
         for lam in lambda_e_values:
             col = f"ced_lam{lam:.2f}"
             if col in sub.columns:
-                names.append(f"CED λ={lam}")
+                names.append(f"CED lam={lam}")
                 aucs.append(safe_auc(sub["label"], sub[col]))
-        names.append("KL"); aucs.append(safe_auc(sub["label"], sub["kl"]))
+        if "kl_sum" in sub.columns:
+            names.append("KL_sum"); aucs.append(safe_auc(sub["label"], sub["kl_sum"]))
         if "cosine_dist" in sub.columns:
             names.append("Cosine"); aucs.append(safe_auc(sub["label"], sub["cosine_dist"]))
         ax.barh(names, aucs, color=["green" if a > 0.85 else "orange" if a > 0.75 else "red" for a in aucs])
@@ -1158,7 +1273,7 @@ def plot_results(df, lambda_e_values, layers, result_dir):
     # 3. AUC by layer
     ax = axes[0, 2]
     if len(sub) > 0 and sub["label"].nunique() > 1:
-        layer_names, layer_aucs = ["logits"], [safe_auc(sub["label"], sub["js"])]
+        layer_names, layer_aucs = ["CED"], [safe_auc(sub["label"], sub["ced"])]
         for l in layers:
             col = f"layer_{l}_js"
             if col in sub.columns and sub[col].notna().sum() > 10:
@@ -1174,18 +1289,22 @@ def plot_results(df, lambda_e_values, layers, result_dir):
     # 4. ROC curve
     ax = axes[1, 0]
     if len(sub) > 0 and sub["label"].nunique() > 1:
-        fpr, tpr, _ = roc_curve(sub["label"], sub["js"])
-        ax.plot(fpr, tpr, label=f"JS (AUC={safe_auc(sub['label'], sub['js']):.3f})", lw=2)
+        fpr, tpr, _ = roc_curve(sub["label"], sub["ced"])
+        ax.plot(fpr, tpr, label=f"CED (AUC={safe_auc(sub['label'], sub['ced']):.3f})", lw=2, color="red")
+        if "js_sum" in sub.columns:
+            fpr2, tpr2, _ = roc_curve(sub["label"], sub["js_sum"])
+            ax.plot(fpr2, tpr2, label=f"JS_sum (AUC={safe_auc(sub['label'], sub['js_sum']):.3f})", lw=2, color="blue", ls="--")
         ax.plot([0,1],[0,1],"k--",alpha=0.3)
         ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
         ax.set_title("ROC Curve"); ax.legend()
 
     # 5. Control group comparison
     ax = axes[1, 1]
-    if "ctrl_js" in cp.columns and cp["ctrl_js"].notna().sum() > 5:
-        ax.boxplot([cp["js"].dropna(), cp["ctrl_js"].dropna()],
+    ctrl_col = "ctrl_ced" if "ctrl_ced" in cp.columns else None
+    if ctrl_col and cp[ctrl_col].notna().sum() > 5:
+        ax.boxplot([cp["ced"].dropna(), cp[ctrl_col].dropna()],
                    labels=["Object Region", "Control Region"])
-        ax.set_ylabel("JS Divergence")
+        ax.set_ylabel("CED")
         ax.set_title("Object vs Control Region (correct_positive only)")
 
     # 6. Cross-task consistency
@@ -1197,12 +1316,12 @@ def plot_results(df, lambda_e_values, layers, result_dir):
         hal_t = t[t["behavior"] == "hallucination"]
         if len(cp_t) >= 3 and len(hal_t) >= 3:
             s = pd.concat([cp_t.assign(label=1), hal_t.assign(label=0)])
-            task_aucs[task] = safe_auc(s["label"], s["js"])
+            task_aucs[task] = safe_auc(s["label"], s["ced"])
     if task_aucs:
         ax.bar(task_aucs.keys(), task_aucs.values(),
                color=["green" if v > 0.85 else "orange" for v in task_aucs.values()])
         ax.axhline(0.85, color="red", ls="--", alpha=0.5)
-        ax.set_ylabel("AUC"); ax.set_title("Cross-task Consistency")
+        ax.set_ylabel("AUC (CED)"); ax.set_title("Cross-task Consistency")
         ax.set_ylim(0.5, 1.0)
 
     plt.tight_layout()
@@ -1210,6 +1329,7 @@ def plot_results(df, lambda_e_values, layers, result_dir):
     plt.savefig(plot_file, dpi=150)
     plt.close()
     print(f"\nCharts saved to {plot_file}")
+
 
 # ============================================================
 # Main Entry Point
@@ -1285,6 +1405,7 @@ Examples:
     else:
         print(f"Error: Unknown mode '{args.mode}'")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
