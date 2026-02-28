@@ -101,15 +101,21 @@ if [ -f "$HF_WHL" ]; then
         exit 1
     }
 else
-    echo "  ✗ 未找到huggingface_hub-0.21.4 wheel文件，尝试其他版本..."
+    echo "  ⚠ 未找到huggingface_hub-0.21.4 wheel文件，尝试其他版本..."
     # Fallback to any available 0.21.x version
     HF_WHL=$(ls "$WHEELS"/huggingface_hub-0.21*.whl 2>/dev/null | head -1)
     if [ -n "$HF_WHL" ]; then
         pip install --no-index --no-cache-dir --no-deps --force-reinstall \
             --no-warn-script-location "$HF_WHL"
     else
-        echo "  ✗ 未找到兼容的huggingface_hub wheel文件"
-        exit 1
+        echo "  ⚠ 未找到wheel文件，尝试从PyPI安装0.21.4..."
+        pip install --no-cache-dir "huggingface_hub==0.21.4" 2>/dev/null || {
+            echo "  ⚠ PyPI安装失败，尝试安装最新兼容版本..."
+            pip install --no-cache-dir "huggingface_hub>=0.21.0,<0.22.0" 2>/dev/null || {
+                echo "  ✗ huggingface_hub安装失败"
+                exit 1
+            }
+        }
     fi
 fi
 
