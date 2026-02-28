@@ -266,19 +266,14 @@ echo "  ✓ 环境验证通过"
 echo ""
 echo "[3/4] 复制p0_experiment.py..."
 
-if [ ! -f "$CODE_DIR/p0_experiment.py" ]; then
-    # 优先从phase0目录（脚本所在目录）复制
-    SCRIPT_DIR="$(dirname $(readlink -f $0))"
-    if [ -f "$SCRIPT_DIR/p0_experiment.py" ]; then
-        cp "$SCRIPT_DIR/p0_experiment.py" "$CODE_DIR/"
-    elif [ -f "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/phase0/p0_experiment.py" ]; then
-        cp "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/phase0/p0_experiment.py" "$CODE_DIR/"
-    else
-        echo "  ✗ 找不到p0_experiment.py！"
-        exit 1
-    fi
+# 每次都复制最新版本（不再跳过）
+if [ -f "$SCRIPT_DIR/p0_experiment.py" ]; then
+    cp "$SCRIPT_DIR/p0_experiment.py" "$CODE_DIR/"
+    echo "  ✓ 从 $SCRIPT_DIR 复制最新 p0_experiment.py"
+else
+    echo "  ✗ 找不到 $SCRIPT_DIR/p0_experiment.py！"
+    exit 1
 fi
-echo "  ✓ p0_experiment.py已就绪"
 
 # ============================================================
 # STEP 4: 运行实验
