@@ -224,7 +224,7 @@ def safe_auc(labels, scores):
 class VisualTokenHook:
     """Hook for capturing and modifying visual encoder output.
 
-    IMPORTANT: Must be registered on model.visual (Qwen3-VL top-level).
+    IMPORTANT: Must be registered on model.model.visual (Qwen3-VL architecture).
     """
 
     def __init__(self):
@@ -233,8 +233,8 @@ class VisualTokenHook:
         self._handle = None
 
     def register(self, model):
-        """Register hook on model.visual (NOT model.model.visual)."""
-        self._handle = model.visual.register_forward_hook(self._fn)
+        """Register hook on model.model.visual."""
+        self._handle = model.model.visual.register_forward_hook(self._fn)
         return self
 
     def remove(self):
@@ -616,32 +616,32 @@ def run_probe(args):
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
-    # NOTE: Hook is on model.visual, not model.model.visual
-    print(f"\nmodel.visual type: {type(model.visual).__name__}")
-    if hasattr(model.visual, 'merger'):
-        print(f"model.visual.merger type: {type(model.visual.merger).__name__}")
+    # Hook is on model.model.visual
+    print(f"\nmodel.model.visual type: {type(model.model.visual).__name__}")
+    if hasattr(model.model.visual, 'merger'):
+        print(f"model.model.visual.merger type: {type(model.model.visual.merger).__name__}")
 
     # Architecture parameter detection
     print("\n--- Architecture Parameters ---")
-    spatial_merge_size = getattr(model.visual, 'spatial_merge_size', None)
-    if spatial_merge_size is None and hasattr(model.visual, 'config'):
-        spatial_merge_size = getattr(model.visual.config, 'spatial_merge_size', None)
+    spatial_merge_size = getattr(model.model.visual, 'spatial_merge_size', None)
+    if spatial_merge_size is None and hasattr(model.model.visual, 'config'):
+        spatial_merge_size = getattr(model.model.visual.config, 'spatial_merge_size', None)
     if spatial_merge_size is None:
         spatial_merge_size = 2
         print(f"  spatial_merge_size: not detected, using default {spatial_merge_size}")
     else:
         print(f"  spatial_merge_size: {spatial_merge_size} (merges {spatial_merge_size}x{spatial_merge_size} patches per token)")
 
-    patch_size = getattr(model.visual, 'patch_size', None)
-    if patch_size is None and hasattr(model.visual, 'config'):
-        patch_size = getattr(model.visual.config, 'patch_size', None)
+    patch_size = getattr(model.model.visual, 'patch_size', None)
+    if patch_size is None and hasattr(model.model.visual, 'config'):
+        patch_size = getattr(model.model.visual.config, 'patch_size', None)
     if patch_size is None:
         patch_size = 14
         print(f"  patch_size: not detected, using default {patch_size}")
     else:
         print(f"  patch_size: {patch_size}")
 
-    vis_params = sum(p.numel() for p in model.visual.parameters())
+    vis_params = sum(p.numel() for p in model.model.visual.parameters())
     print(f"\nVisual encoder parameters: {vis_params / 1e6:.1f}M")
 
     print(f"\nCED config: T_KEY_SIZE={T_KEY_SIZE}, DEFAULT_LAMBDA_E={DEFAULT_LAMBDA_E}")
@@ -704,7 +704,7 @@ def run_probe(args):
         print("WARNING: image_grid_thw not found!")
         sys.exit(1)
 
-    # Step 3: Hook test — registered on model.visual
+    # Step 3: Hook test — registered on model.model.visual
     print("\n--- Step 3: Hook Mechanism Test ---")
 
     captured_output = {}
@@ -720,7 +720,7 @@ def run_probe(args):
             captured_output["tensor"] = output.last_hidden_state.detach().clone()
         return output
 
-    handle = model.visual.register_forward_hook(capture_hook)
+    handle = model.model.visual.register_forward_hook(capture_hook)
 
     with torch.no_grad():
         orig_out = model(**inputs, output_hidden_states=True, return_dict=True)
@@ -805,7 +805,7 @@ def run_probe(args):
             out.last_hidden_state = modified_features.to(device=target_device, dtype=target_dtype)
         return out
 
-    handle2 = model.visual.register_forward_hook(replace_hook)
+    handle2 = model.model.visual.register_forward_hook(replace_hook)
     with torch.no_grad():
         cf_out = model(**inputs, output_hidden_states=True, return_dict=True)
     handle2.remove()
@@ -860,7 +860,7 @@ def run_probe(args):
             out_copy.last_hidden_state = ctrl_features.to(device=target_device, dtype=target_dtype)
         return out_copy
 
-    handle3 = model.visual.register_forward_hook(ctrl_hook)
+    handle3 = model.model.visual.register_forward_hook(ctrl_hook)
     with torch.no_grad():
         ctrl_out = model(**inputs, output_hidden_states=True, return_dict=True)
     handle3.remove()

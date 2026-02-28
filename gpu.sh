@@ -248,7 +248,7 @@ model = Qwen3VLForConditionalGeneration.from_pretrained(
     model_path, torch_dtype=torch.bfloat16, attn_implementation='sdpa'
 ).to(device).eval()
 print(f'✓ 模型加载成功')
-print(f'  视觉编码器类型: {type(model.visual).__name__}')
+print(f'  视觉编码器类型: {type(model.model.visual).__name__}')
 
 processor = AutoProcessor.from_pretrained(model_path)
 print(f'✓ Processor加载成功')
