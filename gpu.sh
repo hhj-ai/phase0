@@ -109,9 +109,9 @@ else
             --no-warn-script-location "$HF_WHL"
     else
         echo "  ⚠ 未找到wheel文件，尝试从PyPI安装0.21.4..."
-        pip install --no-cache-dir --no-find-links --index-url https://pypi.org/simple/ "huggingface_hub==0.21.4" || {
+        pip install --no-cache-dir --index-url https://pypi.org/simple/ "huggingface_hub==0.21.4" || {
             echo "  ⚠ PyPI安装失败，尝试安装最新兼容版本..."
-            pip install --no-cache-dir --no-find-links --index-url https://pypi.org/simple/ "huggingface_hub>=0.21.0,<0.22.0" || {
+            pip install --no-cache-dir --index-url https://pypi.org/simple/ "huggingface_hub>=0.21.0,<0.22.0" || {
                 echo "  ✗ huggingface_hub安装失败，请检查网络连接或手动下载wheel文件"
                 echo "     下载地址: https://pypi.org/project/huggingface-hub/0.21.4/#files"
                 exit 1
@@ -227,7 +227,7 @@ model = Qwen3VLForConditionalGeneration.from_pretrained(
     model_path, torch_dtype=torch.bfloat16, attn_implementation='sdpa'
 ).to(device).eval()
 print(f'✓ 模型加载成功')
-print(f'  视觉编码器类型: {type(model.model.visual).__name__}')
+print(f'  视觉编码器类型: {type(model.visual).__name__}')
 
 processor = AutoProcessor.from_pretrained(model_path)
 print(f'✓ Processor加载成功')
@@ -298,7 +298,7 @@ rm -f "$RESULT_DIR"/p0b_shard_*.csv
 PIDS=()
 for i in $(seq 0 $((NUM_GPUS-1))); do
     CUDA_VISIBLE_DEVICES=$i python p0_experiment.py \
-        --mode worker --shard_id $i --num_shards $NUM_GPUS \
+        --mode worker --shard_idx $i --num_shards $NUM_GPUS \
         --num_samples 400 --seed 42 \
         > "$LOG_DIR/p0b_w${i}.log" 2>&1 &
     PIDS+=($!)
