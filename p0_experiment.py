@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import random
+import hashlib
 import argparse
 import warnings
 import glob
@@ -91,6 +92,76 @@ def kl_divergence(p, q):
 def shannon_entropy(p):
     """Shannon entropy in bits."""
     return float(entropy(_to_prob(p), base=2))
+
+# ============================================================
+# Replacement Strategies
+# ============================================================
+
+def build_mean_mods(vis_feat: torch.Tensor, target_idx: List[int]) -> Dict[int, torch.Tensor]:
+    surr_idx = sorted(set(range(vis_feat.shape[0])) - set(target_idx))
+    replacement = vis_feat[surr_idx].mean(0) if surr_idx else vis_feat.mean(0)
+    return {i: replacement for i in target_idx}
+
+
+def build_moment_noise_mods(
+    vis_feat: torch.Tensor,
+    target_idx: List[int],
+    noise_scale: float = 1.0,
+    eps: float = 1e-6,
+    seed: int = 0,
+) -> Dict[int, torch.Tensor]:
+    """Moment-matching noise replacement (Option 2A).
+
+    For background set S (all non-target tokens):
+        mu = mean_{j in S} x_j
+        sigma = std_{j in S} x_j  (per-dim)
+    For each target token i:
+        x_i^cf = mu + noise_scale * eps_i * sigma,  eps_i ~ N(0, 1)
+
+    This keeps the counterfactual feature statistically similar to the local background
+    (matches 1st/2nd moments) and avoids the strong OOD effect of a single global mean vector.
+    """
+    if len(target_idx) == 0:
+        return {}
+
+    device = vis_feat.device
+    dtype = vis_feat.dtype
+
+    surr_idx = sorted(set(range(vis_feat.shape[0])) - set(target_idx))
+    bg = vis_feat[surr_idx] if len(surr_idx) > 0 else vis_feat
+
+    # stats in fp32 for stability
+    bg_f = bg.float()
+    mu = bg_f.mean(dim=0)                                # [D]
+    sigma = bg_f.std(dim=0, unbiased=False).clamp_min(eps)  # [D]
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+
+    n = len(target_idx)
+    noise = torch.randn((n, mu.numel()), device=device, generator=gen, dtype=torch.float32)
+    repl = (mu.unsqueeze(0) + noise_scale * noise * sigma.unsqueeze(0)).to(dtype)
+
+    mods: Dict[int, torch.Tensor] = {}
+    for k, idx in enumerate(target_idx):
+        mods[int(idx)] = repl[k].detach()
+    return mods
+
+
+def build_mods(
+    vis_feat: torch.Tensor,
+    target_idx: List[int],
+    replace_mode: str = "moment_noise",
+    noise_scale: float = 1.0,
+    seed: int = 0,
+) -> Dict[int, torch.Tensor]:
+    if replace_mode == "mean":
+        return build_mean_mods(vis_feat, target_idx)
+    elif replace_mode == "moment_noise":
+        return build_moment_noise_mods(vis_feat, target_idx, noise_scale=noise_scale, seed=seed)
+    else:
+        raise ValueError(f"Unknown replace_mode: {replace_mode}")
+
 
 
 def get_output_device_dtype(output):
@@ -517,7 +588,7 @@ def get_model_answer(model, processor, image, question, device):
 
 
 def process_sample(sample, model, processor, hook, device, layers,
-                   lambda_e_values, spatial_merge_size=2, t_key_size=T_KEY_SIZE):
+                   lambda_e_values, spatial_merge_size=2, t_key_size=T_KEY_SIZE, replace_mode='moment_noise', noise_scale=1.0, global_seed=42):
     """Process a single sample through CED pipeline.
 
     Core logic:
@@ -582,12 +653,12 @@ def process_sample(sample, model, processor, hook, device, layers,
                                  grid_h, grid_w, spatial_merge_size)
     if not target_idx:
         return None
-
     vis_feat = hook.captured
-    surr_idx = sorted(set(range(vis_feat.shape[0])) - set(target_idx))
-    replacement = vis_feat[surr_idx].mean(0) if surr_idx else vis_feat.mean(0)
-
-    mods = {i: replacement for i in target_idx}
+    # Deterministic per-sample seed (stable across workers)
+    seed_src = (str(sample.get('img_path','')) + '||' + str(sample.get('question',''))).encode('utf-8')
+    sample_seed = (int(hashlib.md5(seed_src).hexdigest(), 16) ^ int(global_seed)) & 0xFFFFFFFF
+    mods = build_mods(vis_feat, target_idx, replace_mode=replace_mode, noise_scale=noise_scale, seed=sample_seed)
+    hook.set_replace(mods)
     hook.set_replace(mods)
     with torch.no_grad():
         cf_out = model(**inputs, output_hidden_states=True, return_dict=True)
@@ -634,15 +705,16 @@ def process_sample(sample, model, processor, hook, device, layers,
         n_ctrl = max(4, len(target_idx))
         ctrl_idx = get_control_indices(sample["all_bboxes"], sample["img_w"], sample["img_h"],
                                        grid_h, grid_w, n_ctrl, spatial_merge_size)
-        surr_ctrl = sorted(set(range(vis_feat.shape[0])) - set(ctrl_idx))
-        repl_ctrl = vis_feat[surr_ctrl].mean(0) if surr_ctrl else vis_feat.mean(0)
+        # Control replacement uses the same strategy to avoid OOD bias in control
+        ctrl_seed = (sample_seed ^ 0x9E3779B9) & 0xFFFFFFFF
+        mods_ctrl = build_mods(vis_feat, ctrl_idx, replace_mode=replace_mode, noise_scale=noise_scale, seed=ctrl_seed)
 
         # Need a fresh capture for control forward
         hook.reset()
         with torch.no_grad():
             _ = model(**inputs, output_hidden_states=False, return_dict=True)
 
-        hook.set_replace({i: repl_ctrl for i in ctrl_idx})
+        hook.set_replace(mods_ctrl)
         with torch.no_grad():
             ctrl_out = model(**inputs, output_hidden_states=False, return_dict=True)
         hook.reset()
@@ -851,17 +923,12 @@ def run_probe(args):
     print(f"  Target region ratio: {len(target_indices) / (merged_grid_h * merged_grid_w) * 100:.1f}%")
 
     vis_features = captured_output["tensor"]
-    all_indices = set(range(vis_features.shape[0]))
-    surr_indices = sorted(all_indices - set(target_indices))
-    if surr_indices:
-        replacement = vis_features[surr_indices].mean(dim=0)
-    else:
-        replacement = vis_features.mean(dim=0)
+    mods = build_mods(vis_features, target_indices, replace_mode=args.replace_mode, noise_scale=args.noise_scale, seed=args.seed)
 
     modified_features = vis_features.clone()
-    for idx in target_indices:
+    for idx, val in mods.items():
         if idx < modified_features.shape[0]:
-            modified_features[idx] = replacement
+            modified_features[idx] = val.to(device=modified_features.device, dtype=modified_features.dtype)
 
     vis_field_name = captured_output["field_name"]
 
@@ -906,13 +973,12 @@ def run_probe(args):
         for c in range(min(2, merged_grid_w)):
             corner_indices.append(r * merged_grid_w + c)
 
-    ctrl_surr = sorted(set(range(vis_features.shape[0])) - set(corner_indices))
-    ctrl_replacement = vis_features[ctrl_surr].mean(dim=0) if ctrl_surr else vis_features.mean(dim=0)
+    mods_ctrl = build_mods(vis_features, corner_indices, replace_mode=args.replace_mode, noise_scale=args.noise_scale, seed=(args.seed ^ 12345))
 
     ctrl_features = vis_features.clone()
-    for idx in corner_indices:
+    for idx, val in mods_ctrl.items():
         if idx < ctrl_features.shape[0]:
-            ctrl_features[idx] = ctrl_replacement
+            ctrl_features[idx] = val.to(device=ctrl_features.device, dtype=ctrl_features.dtype)
 
     def ctrl_hook(module, input, output):
         return replace_visual_output(output, vis_field_name, ctrl_features)
@@ -1051,7 +1117,7 @@ def run_worker(args):
 
     for sample in tqdm(shard_samples, desc=f"Worker-{args.shard_idx}"):
         r = process_sample(sample, model, processor, hook, device,
-                          layers, args.lambda_e_values, spatial_merge_size)
+                          layers, args.lambda_e_values, spatial_merge_size, replace_mode=args.replace_mode, noise_scale=args.noise_scale, global_seed=args.seed)
         if r:
             results.append(r)
             behavior_counts[r["behavior"]] += 1
@@ -1426,6 +1492,13 @@ Examples:
     parser.add_argument("--lambda_e_values", type=float, nargs="+",
                         default=[0.0, 0.05, 0.1, 0.2, 0.5],
                         help="Lambda values for CED (default: 0.0 0.05 0.1 0.2 0.5)")
+    # Counterfactual replacement strategy
+    parser.add_argument("--replace_mode", type=str, default="moment_noise",
+                        choices=["moment_noise", "mean"],
+                        help="Visual-token replacement: moment_noise (default) or mean")
+    parser.add_argument("--noise_scale", type=float, default=1.0,
+                        help="Noise scale for moment_noise replacement (default: 1.0)")
+
 
     # Worker mode arguments
     parser.add_argument("--shard_idx", type=int, default=0,

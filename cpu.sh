@@ -78,6 +78,12 @@ source $SHARED/venv/build_env/bin/activate
 
 cd $WHEELS
 
+echo "  下载pip/venv构建工具..."
+pip download pip setuptools wheel build packaging -d $WHEELS --no-cache-dir \
+    --index-url https://pypi.org/simple \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org
+
+
 echo "  下载requirements依赖..."
 pip download -r $SHARED/code/requirements.txt \
     --index-url https://pypi.org/simple \
@@ -169,6 +175,31 @@ else
     echo "    ✓ COCO val2017 已存在"
 fi
 
+
+# COCO train2014 (needed by POPE; small to keep optional but included)
+echo "  下载COCO train2014 (for POPE)..."
+cd $SHARED/data/datasets
+mkdir -p coco_train2014
+cd coco_train2014
+if [ ! -d "train2014" ]; then
+    if [ ! -f "train2014.zip" ]; then
+        wget -q http://images.cocodataset.org/zips/train2014.zip
+    fi
+    unzip -q train2014.zip
+    echo "    ✓ COCO train2014 完成"
+else
+    echo "    ✓ COCO train2014 已存在"
+fi
+
+# POPE benchmark (existence / language-shortcut stress test)
+echo "  下载POPE benchmark..."
+cd $SHARED/data/datasets
+if [ ! -d "pope" ]; then
+    git clone --depth 1 https://github.com/AoiDragon/POPE.git pope
+    echo "    ✓ POPE 完成"
+else
+    echo "    ✓ POPE 已存在"
+fi
 echo ""
 echo "================================================================"
 echo "  ✓ CPU准备完成！"
