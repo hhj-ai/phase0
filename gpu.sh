@@ -109,10 +109,11 @@ else
             --no-warn-script-location "$HF_WHL"
     else
         echo "  ⚠ 未找到wheel文件，尝试从PyPI安装0.21.4..."
-        pip install --no-cache-dir "huggingface_hub==0.21.4" 2>/dev/null || {
+        pip install --no-cache-dir --no-find-links --index-url https://pypi.org/simple/ "huggingface_hub==0.21.4" || {
             echo "  ⚠ PyPI安装失败，尝试安装最新兼容版本..."
-            pip install --no-cache-dir "huggingface_hub>=0.21.0,<0.22.0" 2>/dev/null || {
-                echo "  ✗ huggingface_hub安装失败"
+            pip install --no-cache-dir --no-find-links --index-url https://pypi.org/simple/ "huggingface_hub>=0.21.0,<0.22.0" || {
+                echo "  ✗ huggingface_hub安装失败，请检查网络连接或手动下载wheel文件"
+                echo "     下载地址: https://pypi.org/project/huggingface-hub/0.21.4/#files"
                 exit 1
             }
         }
