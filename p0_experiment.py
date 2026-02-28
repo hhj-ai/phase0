@@ -435,7 +435,8 @@ def process_sample(sample, model, processor, hook, device, layers, lambda_e_valu
         return None
 
     # Step 4: Object region replacement
-    target_idx = bbox_to_indices(sample["bbox"], sample["img_w"], sample["img_h"], grid_h, grid_w)
+    target_idx = bbox_to_indices(sample["bbox"], sample["img_w"], sample["img_h"],
+                                 grid_h, grid_w, spatial_merge_size)
     if not target_idx:
         return None
 
@@ -660,33 +661,42 @@ def run_probe(args):
     # Step 4: Replacement test
     print("\n--- Step 4: Replacement Test ---")
 
-    # Calculate target token indices
-    col_start = int(bbox[0] / img_w * grid_w)
-    col_end = int(np.ceil((bbox[0] + bbox[2]) / img_w * grid_w))
-    row_start = int(bbox[1] / img_h * grid_h)
-    row_end = int(np.ceil((bbox[1] + bbox[3]) / img_h * grid_h))
+    # Calculate spatial_merge_size from merger_ratio (e.g., ratio=4 means spatial_merge_size=2)
+    spatial_merge_size = int(np.sqrt(merger_ratio)) if merger_ratio > 1 else 2
+
+    # Calculate merged grid dimensions (actual visual token grid after spatial merge)
+    merged_grid_h = grid_h // spatial_merge_size
+    merged_grid_w = grid_w // spatial_merge_size
+
+    # Calculate target token indices using merged grid dimensions
+    col_start = int(bbox[0] / img_w * merged_grid_w)
+    col_end = int(np.ceil((bbox[0] + bbox[2]) / img_w * merged_grid_w))
+    row_start = int(bbox[1] / img_h * merged_grid_h)
+    row_end = int(np.ceil((bbox[1] + bbox[3]) / img_h * merged_grid_h))
     col_start = max(0, col_start)
-    col_end = min(grid_w, col_end)
+    col_end = min(merged_grid_w, col_end)
     row_start = max(0, row_start)
-    row_end = min(grid_h, row_end)
+    row_end = min(merged_grid_h, row_end)
 
     target_indices = []
     for r in range(row_start, row_end):
         for c in range(col_start, col_end):
-            target_indices.append(r * grid_w + c)
+            target_indices.append(r * merged_grid_w + c)
 
     # Enhanced bbox mapping logs
     print(f"\n--- BBox Mapping Validation ---")
     print(f"  Image size: {img_w} x {img_h} pixels")
-    print(f"  Grid size: {grid_w} x {grid_h} tokens")
+    print(f"  Original grid: {grid_w} x {grid_h} tokens")
+    print(f"  Spatial merge size: {spatial_merge_size}")
+    print(f"  Merged grid: {merged_grid_w} x {merged_grid_h} tokens (actual visual tokens)")
     print(f"  BBox (xywh): [{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]")
     print(f"  BBox center: ({bbox[0] + bbox[2]/2:.1f}, {bbox[1] + bbox[3]/2:.1f})")
     print(f"  Mapped token range: cols [{col_start}, {col_end}), rows [{row_start}, {row_end})")
     token_center_x = (col_start + col_end) / 2
     token_center_y = (row_start + row_end) / 2
     print(f"  Mapped token center: ({token_center_x:.1f}, {token_center_y:.1f})")
-    print(f"  Target tokens: {len(target_indices)} / {grid_h * grid_w} total")
-    print(f"  Target region ratio: {len(target_indices) / (grid_h * grid_w) * 100:.1f}%")
+    print(f"  Target tokens: {len(target_indices)} / {merged_grid_h * merged_grid_w} total")
+    print(f"  Target region ratio: {len(target_indices) / (merged_grid_h * merged_grid_w) * 100:.1f}%")
 
     # Compute replacement value
     vis_features = captured_output["tensor"]

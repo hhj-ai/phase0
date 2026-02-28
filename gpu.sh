@@ -91,10 +91,8 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
 echo "  [2/6] 安装huggingface_hub..."
 # Force uninstall any existing version to avoid conflicts
 pip uninstall -y huggingface_hub 2>/dev/null || true
-# Remove any old wheel files to avoid confusion
-rm -f "$WHEELS"/huggingface_hub-0.27*.whl 2>/dev/null || true
-# Use specific version that transformers requires
-HF_WHL="$WHEELS/huggingface_hub-0.28.1-py3-none-any.whl"
+# Use version compatible with the transformers wheel (0.21.x has is_offline_mode)
+HF_WHL="$WHEELS/huggingface_hub-0.21.4-py3-none-any.whl"
 if [ -f "$HF_WHL" ]; then
     pip install --no-index --no-cache-dir --no-deps --force-reinstall \
         --no-warn-script-location \
@@ -103,8 +101,16 @@ if [ -f "$HF_WHL" ]; then
         exit 1
     }
 else
-    echo "  ✗ 未找到huggingface_hub-0.28.1 wheel文件"
-    exit 1
+    echo "  ✗ 未找到huggingface_hub-0.21.4 wheel文件，尝试其他版本..."
+    # Fallback to any available 0.21.x version
+    HF_WHL=$(ls "$WHEELS"/huggingface_hub-0.21*.whl 2>/dev/null | head -1)
+    if [ -n "$HF_WHL" ]; then
+        pip install --no-index --no-cache-dir --no-deps --force-reinstall \
+            --no-warn-script-location "$HF_WHL"
+    else
+        echo "  ✗ 未找到兼容的huggingface_hub wheel文件"
+        exit 1
+    fi
 fi
 
 echo "  [3/6] 安装依赖包..."
