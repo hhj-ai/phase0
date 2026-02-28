@@ -88,37 +88,41 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
     exit 1
 }
 
-echo "  [2/6] 检查huggingface_hub兼容性..."
-# huggingface_hub 0.23+ 移除了is_offline_mode，但transformers还在用
-# 如果缺失，直接注入补丁，不需要降级
-HF_COMPAT=$(python -c "from huggingface_hub import is_offline_mode; print('ok')" 2>/dev/null || echo "")
-if [ "$HF_COMPAT" = "ok" ]; then
+echo "  [2/6] 安装huggingface_hub..."
+# transformers(main)要求 huggingface_hub>=1.3.0
+# 先检查版本是否满足
+HF_OK=$(python -c "
+import huggingface_hub
+from packaging.version import Version
+v = Version(huggingface_hub.__version__)
+print('ok' if v >= Version('1.3.0') else 'old')
+" 2>/dev/null || echo "missing")
+
+if [ "$HF_OK" = "ok" ]; then
     HF_VER=$(python -c "import huggingface_hub; print(huggingface_hub.__version__)")
-    echo "  ✓ huggingface_hub $HF_VER 兼容"
+    echo "  ✓ huggingface_hub $HF_VER >= 1.3.0，跳过"
 else
-    HF_VER=$(python -c "import huggingface_hub; print(huggingface_hub.__version__)" 2>/dev/null || echo "未安装")
-    echo "  ⚠ huggingface_hub $HF_VER 缺少is_offline_mode，注入兼容补丁..."
-    # 找到huggingface_hub的__init__.py，注入is_offline_mode函数
-    HF_INIT=$(python -c "import huggingface_hub, os; print(os.path.join(os.path.dirname(huggingface_hub.__file__), '__init__.py'))" 2>/dev/null)
-    if [ -n "$HF_INIT" ] && [ -f "$HF_INIT" ]; then
-        # 检查是否已经打过补丁
-        if ! grep -q "def is_offline_mode" "$HF_INIT"; then
-            echo "" >> "$HF_INIT"
-            echo "# === P0 compat patch: is_offline_mode ===" >> "$HF_INIT"
-            echo "import os as _os" >> "$HF_INIT"
-            echo "def is_offline_mode() -> bool:" >> "$HF_INIT"
-            echo "    return _os.environ.get('HF_HUB_OFFLINE', '0') == '1' or _os.environ.get('TRANSFORMERS_OFFLINE', '0') == '1'" >> "$HF_INIT"
-            echo "  ✓ 补丁注入成功"
-        else
-            echo "  ✓ 补丁已存在"
-        fi
-        # 验证
-        python -c "from huggingface_hub import is_offline_mode; print('  ✓ is_offline_mode可用')" || {
-            echo "  ✗ 补丁注入失败"
+    echo "  需要升级huggingface_hub到>=1.3.0"
+    pip uninstall -y huggingface_hub 2>/dev/null || true
+
+    # 优先用wheels目录里的新版
+    HF_WHL=$(ls -t "$WHEELS"/huggingface_hub-1.*.whl 2>/dev/null | head -1)
+    if [ -z "$HF_WHL" ]; then
+        HF_WHL=$(ls -t "$WHEELS"/huggingface_hub-*.whl 2>/dev/null | head -1)
+    fi
+
+    if [ -n "$HF_WHL" ] && [ -f "$HF_WHL" ]; then
+        echo "  使用wheel: $(basename $HF_WHL)"
+        pip install --no-cache-dir --no-deps --force-reinstall \
+            --no-warn-script-location "$HF_WHL" || {
+            echo "  ✗ huggingface_hub安装失败"
             exit 1
         }
     else
-        echo "  ✗ huggingface_hub未安装，无法打补丁"
+        echo "  ✗ 未找到huggingface_hub>=1.3.0 wheel！"
+        echo "     请在有网机器上运行："
+        echo "       pip download 'huggingface_hub>=1.3.0,<2.0' --only-binary=:all: -d /tmp/hf_wheel --no-deps"
+        echo "     然后scp到: $WHEELS/"
         exit 1
     fi
 fi
