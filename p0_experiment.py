@@ -117,6 +117,73 @@ def get_output_device_dtype(output):
     raise ValueError(f"Cannot find tensor in output of type {type(output)}")
 
 
+def replace_visual_output(output, field_name, new_tensor):
+    """Replace a field in a ModelOutput (OrderedDict subclass) correctly.
+
+    ModelOutput is both a dataclass and OrderedDict.
+    We must update BOTH the dict key and the attribute to ensure
+    downstream code sees the replacement regardless of access method.
+    """
+    target_device, target_dtype = get_output_device_dtype(output)
+    val = new_tensor.to(device=target_device, dtype=target_dtype)
+
+    # Reconstruct the output with the replaced field
+    # This is the most reliable way for ModelOutput subclasses
+    new_kwargs = {}
+    for key in output.keys():
+        if key == field_name:
+            new_kwargs[key] = val
+        else:
+            new_kwargs[key] = output[key]
+    return output.__class__(**new_kwargs)
+
+
+def find_main_visual_field(output):
+    """Find the main tensor field in visual encoder output.
+
+    Returns (field_name, tensor) for the primary visual feature tensor.
+    """
+    # Try common field names in order of preference
+    for name in ['pooler_output', 'last_hidden_state']:
+        if hasattr(output, name):
+            val = getattr(output, name)
+            if val is not None and torch.is_tensor(val):
+                return name, val
+
+    # Fallback: scan all fields for tensors
+    if hasattr(output, 'keys'):
+        for key in output.keys():
+            val = output[key]
+            if torch.is_tensor(val):
+                return key, val
+
+    return None, None
+
+
+def debug_visual_output(output):
+    """Print all fields and shapes of a visual encoder output for debugging."""
+    print(f"  Output type: {type(output).__name__}")
+    if hasattr(output, 'keys'):
+        for key in output.keys():
+            val = output[key]
+            if torch.is_tensor(val):
+                print(f"  Field '{key}': tensor {val.shape} {val.dtype}")
+            elif val is None:
+                print(f"  Field '{key}': None")
+            elif isinstance(val, (tuple, list)):
+                print(f"  Field '{key}': {type(val).__name__} len={len(val)}")
+            else:
+                print(f"  Field '{key}': {type(val).__name__}")
+    else:
+        for attr in ['pooler_output', 'last_hidden_state', 'hidden_states']:
+            if hasattr(output, attr):
+                val = getattr(output, attr)
+                if torch.is_tensor(val):
+                    print(f"  Attr '{attr}': tensor {val.shape} {val.dtype}")
+                else:
+                    print(f"  Attr '{attr}': {type(val).__name__ if val is not None else 'None'}")
+
+
 def compute_tkey_ced(orig_logits_tkey, cf_logits_tkey, lambda_e_values):
     """Compute CED metrics over T_key tokens (per-token JS + entropy penalty, then sum).
 
@@ -225,10 +292,13 @@ class VisualTokenHook:
     """Hook for capturing and modifying visual encoder output.
 
     IMPORTANT: Must be registered on model.model.visual (Qwen3-VL architecture).
+    Uses find_main_visual_field() to detect the correct tensor field, and
+    replace_visual_output() to properly reconstruct the ModelOutput.
     """
 
     def __init__(self):
         self.captured = None
+        self._field_name = None  # which field contains visual features
         self._modifications = None
         self._handle = None
 
@@ -249,30 +319,25 @@ class VisualTokenHook:
         self._modifications = mods
 
     def _fn(self, module, input, output):
-        """Handle dataclass output with pooler_output field."""
-        target_device, target_dtype = get_output_device_dtype(output)
+        """Capture or replace visual features in ModelOutput."""
+        field_name, tensor = find_main_visual_field(output)
 
         if self._modifications is None:
             # Capture mode
-            if hasattr(output, 'pooler_output') and output.pooler_output is not None:
-                self.captured = output.pooler_output.detach().clone()
-            elif hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
-                self.captured = output.last_hidden_state.detach().clone()
+            if tensor is not None:
+                self.captured = tensor.detach().clone()
+                self._field_name = field_name
             return output
         else:
             # Replace mode
-            if self.captured is None:
+            if self.captured is None or self._field_name is None:
                 return output
+            target_device, target_dtype = get_output_device_dtype(output)
             mod = self.captured.clone().to(device=target_device, dtype=target_dtype)
             for idx, val in self._modifications.items():
                 if 0 <= idx < mod.shape[0]:
                     mod[idx] = val.to(device=mod.device, dtype=mod.dtype)
-            out_copy = copy(output)
-            if hasattr(output, 'pooler_output'):
-                out_copy.pooler_output = mod
-            elif hasattr(output, 'last_hidden_state'):
-                out_copy.last_hidden_state = mod
-            return out_copy
+            return replace_visual_output(output, self._field_name, mod)
 
 
 # ============================================================
@@ -710,14 +775,15 @@ def run_probe(args):
     captured_output = {}
 
     def capture_hook(module, input, output):
-        if hasattr(output, 'pooler_output') and output.pooler_output is not None:
-            captured_output["shape"] = output.pooler_output.shape
-            captured_output["dtype"] = output.pooler_output.dtype
-            captured_output["tensor"] = output.pooler_output.detach().clone()
-        elif hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
-            captured_output["shape"] = output.last_hidden_state.shape
-            captured_output["dtype"] = output.last_hidden_state.dtype
-            captured_output["tensor"] = output.last_hidden_state.detach().clone()
+        print("\n  --- Visual Encoder Output Structure ---")
+        debug_visual_output(output)
+        field_name, tensor = find_main_visual_field(output)
+        if tensor is not None:
+            captured_output["field_name"] = field_name
+            captured_output["shape"] = tensor.shape
+            captured_output["dtype"] = tensor.dtype
+            captured_output["tensor"] = tensor.detach().clone()
+            print(f"  -> Using field: '{field_name}', shape: {tensor.shape}")
         return output
 
     handle = model.model.visual.register_forward_hook(capture_hook)
@@ -796,14 +862,10 @@ def run_probe(args):
         if idx < modified_features.shape[0]:
             modified_features[idx] = replacement
 
+    vis_field_name = captured_output["field_name"]
+
     def replace_hook(module, input, output):
-        target_device, target_dtype = get_output_device_dtype(output)
-        out = copy(output)
-        if hasattr(out, 'pooler_output'):
-            out.pooler_output = modified_features.to(device=target_device, dtype=target_dtype)
-        elif hasattr(out, 'last_hidden_state'):
-            out.last_hidden_state = modified_features.to(device=target_device, dtype=target_dtype)
-        return out
+        return replace_visual_output(output, vis_field_name, modified_features)
 
     handle2 = model.model.visual.register_forward_hook(replace_hook)
     with torch.no_grad():
@@ -852,13 +914,7 @@ def run_probe(args):
             ctrl_features[idx] = ctrl_replacement
 
     def ctrl_hook(module, input, output):
-        target_device, target_dtype = get_output_device_dtype(output)
-        out_copy = copy(output)
-        if hasattr(out_copy, 'pooler_output'):
-            out_copy.pooler_output = ctrl_features.to(device=target_device, dtype=target_dtype)
-        elif hasattr(out_copy, 'last_hidden_state'):
-            out_copy.last_hidden_state = ctrl_features.to(device=target_device, dtype=target_dtype)
-        return out_copy
+        return replace_visual_output(output, vis_field_name, ctrl_features)
 
     handle3 = model.model.visual.register_forward_hook(ctrl_hook)
     with torch.no_grad():
