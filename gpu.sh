@@ -16,6 +16,7 @@ RESULT_DIR="$SHARED/results"
 LOG_DIR="$SHARED/logs"
 CODE_DIR="$SHARED/code"
 WHEELS="$SHARED/data/wheels"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$SHARED/venv/p0_env"
 SITE="$VENV/lib/python3.10/site-packages"
 
