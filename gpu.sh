@@ -89,34 +89,35 @@ pip install --no-index --no-cache-dir --find-links=. --no-warn-script-location \
 }
 
 echo "  [2/6] 安装huggingface_hub..."
-# Force uninstall any existing version to avoid conflicts
-pip uninstall -y huggingface_hub 2>/dev/null || true
-# Use version compatible with the transformers wheel (0.21.x has is_offline_mode)
-HF_WHL="$WHEELS/huggingface_hub-0.21.4-py3-none-any.whl"
-if [ -f "$HF_WHL" ]; then
-    pip install --no-index --no-cache-dir --no-deps --force-reinstall \
-        --no-warn-script-location \
-        "$HF_WHL" 2>/dev/null || {
-        echo "  ✗ huggingface_hub安装失败"
-        exit 1
-    }
+# Check if already installed with compatible version
+HF_INSTALLED=$(python -c "import huggingface_hub; print(huggingface_hub.__version__)" 2>/dev/null || echo "")
+if [ -n "$HF_INSTALLED" ]; then
+    echo "  ✓ huggingface_hub已安装: $HF_INSTALLED，跳过"
 else
-    echo "  ⚠ 未找到huggingface_hub-0.21.4 wheel文件，尝试其他版本..."
-    # Fallback to any available 0.21.x version
-    HF_WHL=$(ls "$WHEELS"/huggingface_hub-0.21*.whl 2>/dev/null | head -1)
-    if [ -n "$HF_WHL" ]; then
+    # Try wheel file first (offline)
+    HF_WHL="$WHEELS/huggingface_hub-0.21.4-py3-none-any.whl"
+    if [ -f "$HF_WHL" ]; then
         pip install --no-index --no-cache-dir --no-deps --force-reinstall \
-            --no-warn-script-location "$HF_WHL"
+            --no-warn-script-location "$HF_WHL" 2>/dev/null || {
+            echo "  ✗ huggingface_hub安装失败"
+            exit 1
+        }
     else
-        echo "  ⚠ 未找到wheel文件，尝试从PyPI安装0.21.4..."
-        pip install --no-cache-dir --index-url https://pypi.org/simple/ "huggingface_hub==0.21.4" || {
-            echo "  ⚠ PyPI安装失败，尝试安装最新兼容版本..."
-            pip install --no-cache-dir --index-url https://pypi.org/simple/ "huggingface_hub>=0.21.0,<0.22.0" || {
-                echo "  ✗ huggingface_hub安装失败，请检查网络连接或手动下载wheel文件"
+        # Fallback: any huggingface_hub wheel in wheels dir
+        HF_WHL=$(ls "$WHEELS"/huggingface_hub-*.whl 2>/dev/null | head -1)
+        if [ -n "$HF_WHL" ]; then
+            pip install --no-index --no-cache-dir --no-deps --force-reinstall \
+                --no-warn-script-location "$HF_WHL"
+        else
+            # Last resort: try pip install without version pin (may use pip global config)
+            echo "  ⚠ 未找到wheel文件，尝试pip install..."
+            pip install --no-cache-dir "huggingface_hub>=0.19.0" 2>/dev/null || {
+                echo "  ✗ huggingface_hub安装失败"
+                echo "     请手动下载wheel放到: $WHEELS/"
                 echo "     下载地址: https://pypi.org/project/huggingface-hub/0.21.4/#files"
                 exit 1
             }
-        }
+        fi
     fi
 fi
 
