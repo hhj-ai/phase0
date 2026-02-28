@@ -43,20 +43,19 @@ echo ""
 # ------------------------------------------------------------
 zip_ok () {
   local f="$1"
-  python - <<PY
+  python - "$f" <<'PY' >/dev/null
 import sys, zipfile
 f=sys.argv[1]
 try:
-    with zipfile.ZipFile(f,'r') as z:
-        bad=z.testzip()
+    with zipfile.ZipFile(f, "r") as z:
+        bad = z.testzip()
         if bad is not None:
-            print(f"[zipcheck] BAD member: {bad}")
+            # corrupted member
             sys.exit(2)
-except Exception as e:
-    print(f"[zipcheck] FAIL: {e}")
+except Exception:
     sys.exit(2)
-print("[zipcheck] OK")
-PY "$f" >/dev/null
+sys.exit(0)
+PY
 }
 
 download_zip () {
