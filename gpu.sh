@@ -105,10 +105,11 @@ else
     echo "  需要升级huggingface_hub到>=1.3.0"
     pip uninstall -y huggingface_hub 2>/dev/null || true
 
-    # 优先用wheels目录里的新版
-    HF_WHL=$(ls -t "$WHEELS"/huggingface_hub-1.*.whl 2>/dev/null | head -1)
+    # 优先用wheels目录里的新版，也搜索脚本所在目录（git repo里的wheel）
+    SCRIPT_DIR="$(dirname $(readlink -f $0))"
+    HF_WHL=$(ls -t "$WHEELS"/huggingface_hub-1.*.whl "$SCRIPT_DIR"/huggingface_hub-1.*.whl 2>/dev/null | head -1)
     if [ -z "$HF_WHL" ]; then
-        HF_WHL=$(ls -t "$WHEELS"/huggingface_hub-*.whl 2>/dev/null | head -1)
+        HF_WHL=$(ls -t "$WHEELS"/huggingface_hub-*.whl "$SCRIPT_DIR"/huggingface_hub-*.whl 2>/dev/null | head -1)
     fi
 
     if [ -n "$HF_WHL" ] && [ -f "$HF_WHL" ]; then
@@ -202,6 +203,18 @@ for i in range(min(torch.cuda.device_count(), $NUM_GPUS)):
 }
 
 echo ""
+echo "  检查einops..."
+python -c "import einops" 2>/dev/null || {
+    EINOPS_WHL=$(ls -t "$WHEELS"/einops-*.whl "$SCRIPT_DIR"/einops-*.whl 2>/dev/null | head -1)
+    if [ -n "$EINOPS_WHL" ] && [ -f "$EINOPS_WHL" ]; then
+        echo "  安装einops: $(basename $EINOPS_WHL)"
+        pip install --no-cache-dir --no-deps --no-warn-script-location "$EINOPS_WHL"
+    else
+        echo "  ✗ einops未找到wheel"
+        exit 1
+    fi
+}
+
 echo "  检查transformers和Qwen3VL..."
 python -c "
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
@@ -211,7 +224,7 @@ print(f'✓ huggingface_hub {huggingface_hub.__version__}')
 import einops
 print(f'✓ einops {einops.__version__}')
 " || {
-    echo "  ✗ transformers导入失败"
+    echo "  ✗ 关键包导入失败"
     exit 1
 }
 
