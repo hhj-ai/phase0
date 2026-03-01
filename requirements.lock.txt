@@ -1,3 +1,0 @@
-# "Lock" kept intentionally loose for cluster compatibility.
-# If you need strict reproducibility, pin versions after confirming what's available in your pip index.
--r requirements.notorch.txt

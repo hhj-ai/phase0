@@ -1,0 +1,14 @@
+numpy
+pandas
+scikit-learn
+Pillow
+tqdm
+
+# coco
+pycocotools
+
+# vlm
+transformers
+accelerate
+datasets
+qwen-vl-utils

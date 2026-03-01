@@ -1,0 +1,2 @@
+# datasets 3.2.0 requires fsspec[http] <= 2024.9.0
+fsspec<=2024.9.0

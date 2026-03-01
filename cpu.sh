@@ -1,73 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# P0: CPU env bootstrap (py310)
-# - ALWAYS re-download wheels
-# - then install offline from wheelhouse
-# - venv uses --system-site-packages
-# ============================================================
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${ROOT_DIR}/venv/p0_env"
-PYBIN="${VENV_DIR}/bin/python"
-PIP="${PYBIN} -m pip"
-
 WHEELHOUSE="${ROOT_DIR}/offline_wheels/py310"
+
+REQ_TXT="${ROOT_DIR}/requirements.cpu.txt"
+CONSTRAINTS_TXT="${ROOT_DIR}/constraints.cpu.txt"
+
+# ------------------------------
+# Index settings (force HTTPS)
+# ------------------------------
+# Some clusters ship a global pip config pointing to http://pip.sankuai.com/simple/
+# which pip treats as insecure and ignores. We override via CLI args.
+INDEX_URL="${INDEX_URL:-https://pip.sankuai.com/simple}"
+EXTRA_INDEX_URL="${EXTRA_INDEX_URL:-https://pypi.org/simple}"
+PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pip.sankuai.com}"
+
+echo "[P0][cpu] ROOT_DIR       : ${ROOT_DIR}"
+echo "[P0][cpu] VENV_DIR       : ${VENV_DIR}"
+echo "[P0][cpu] WHEELHOUSE     : ${WHEELHOUSE}"
+echo "[P0][cpu] INDEX_URL      : ${INDEX_URL}"
+echo "[P0][cpu] EXTRA_INDEX_URL: ${EXTRA_INDEX_URL}"
+
 mkdir -p "${WHEELHOUSE}"
 
-echo "[P0] ROOT_DIR   : ${ROOT_DIR}"
-echo "[P0] VENV_DIR   : ${VENV_DIR}"
-echo "[P0] WHEELHOUSE : ${WHEELHOUSE}"
-
-# 0) Create venv
+# 0) Create venv (reuse system site packages, e.g., preinstalled torch)
 if [[ ! -d "${VENV_DIR}" ]]; then
-  echo "[P0] Creating venv (with --system-site-packages) at: ${VENV_DIR}"
+  echo "[P0][cpu] Creating venv at: ${VENV_DIR}"
   python3.10 -m venv --system-site-packages "${VENV_DIR}"
 fi
 
-# 1) Conservative pip tooling bootstrap (avoid ultra-new pins that mirrors may not have)
-echo "[P0] Bootstrapping pip tooling (conservative)..."
-${PIP} install -q --upgrade "pip<25" "setuptools<82" "wheel<1" || true
-${PIP} --version || true
+PYBIN="${VENV_DIR}/bin/python"
+PIP="${PYBIN} -m pip"
 
-# 2) Constraints (fix known conflict: datasets 3.2.0 requires fsspec<=2024.9.0)
-CONSTRAINTS_TXT="${ROOT_DIR}/constraints.cpu.txt"
-cat > "${CONSTRAINTS_TXT}" << 'EOF'
-fsspec<=2024.9.0
-EOF
-echo "[P0] constraints written: ${CONSTRAINTS_TXT}"
+# 1) Guard files
+test -f "${REQ_TXT}" || { echo "MISSING:${REQ_TXT}"; exit 2; }
+test -f "${CONSTRAINTS_TXT}" || { echo "MISSING:${CONSTRAINTS_TXT}"; exit 2; }
 
-# 3) Requirements (edit as needed)
-REQ_TXT="${ROOT_DIR}/requirements.cpu.txt"
-cat > "${REQ_TXT}" << 'EOF'
-numpy
-pandas
-scikit-learn
-Pillow
-tqdm
-pycocotools
-qwen-vl-utils
-transformers
-accelerate
-datasets
-EOF
-echo "[P0] requirements written: ${REQ_TXT}"
-
-# 4) ALWAYS re-download wheels
-echo "[P0] Cleaning wheelhouse..."
+# 2) ALWAYS re-download wheels (only wheelhouse is cleaned)
+echo "[P0][cpu] Cleaning wheelhouse..."
 rm -rf "${WHEELHOUSE:?}/"* || true
 
-echo "[P0] Downloading wheels into wheelhouse (network required)..."
-${PIP} download -d "${WHEELHOUSE}" -c "${CONSTRAINTS_TXT}" -r "${REQ_TXT}"
+echo "[P0][cpu] Downloading wheels into wheelhouse (network required)..."
+${PIP} download   -d "${WHEELHOUSE}"   -r "${REQ_TXT}"   -c "${CONSTRAINTS_TXT}"   -i "${INDEX_URL}"   --extra-index-url "${EXTRA_INDEX_URL}"   --trusted-host "${PIP_TRUSTED_HOST}"   --timeout 60 --retries 10
 
-# 5) Offline install from wheelhouse
-echo "[P0] Installing OFFLINE from wheelhouse..."
-${PIP} install --no-index --find-links "${WHEELHOUSE}" -c "${CONSTRAINTS_TXT}" -r "${REQ_TXT}"
+echo "[P0][cpu] Installing offline from wheelhouse..."
+${PIP} install   --no-index --find-links "${WHEELHOUSE}"   -r "${REQ_TXT}"   -c "${CONSTRAINTS_TXT}"
 
-# 6) Sanity checks
-echo "[P0] Sanity check imports..."
+echo "[P0][cpu] Sanity check imports..."
 ${PYBIN} -c "import sys; print('python', sys.version)"
+${PYBIN} -c "import numpy as np; print('numpy', np.__version__)"
 ${PYBIN} -c "import pycocotools; print('pycocotools OK')"
-${PYBIN} -c "import datasets, fsspec; print('datasets', datasets.__version__, 'fsspec', fsspec.__version__)"
-echo "[P0] DONE."
+
+echo "[P0][cpu] DONE."

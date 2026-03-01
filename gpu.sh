@@ -1,102 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# Phase0 multi-GPU launcher (safe-by-default)
-# - Runs IN-PLACE inside your git repo (no copying / no rsync / no deleting).
-# - Uses a local venv with --system-site-packages to reuse your existing CUDA
-#   PyTorch/Transformers install (so it doesn't "touch your env").
-# -----------------------------------------------------------------------------
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="${ROOT_DIR}/venv/p0_env"
+WHEELHOUSE="${ROOT_DIR}/offline_wheels/py310"
 
-BASE_DIR="${P0_BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-cd "$BASE_DIR"
+REQ_TXT="${ROOT_DIR}/requirements.cpu.txt"
+CONSTRAINTS_TXT="${ROOT_DIR}/constraints.cpu.txt"
 
-# Optional: clean outputs (off by default)
-if [[ "${P0_CLEAN:-0}" == "1" ]]; then
-  echo "[P0] Cleaning results/logs (P0_CLEAN=1)"
-  rm -rf "$BASE_DIR/results" "$BASE_DIR/logs"
-fi
-mkdir -p "$BASE_DIR/results" "$BASE_DIR/logs" "$BASE_DIR/data"
+echo "[P0][gpu] ROOT_DIR   : ${ROOT_DIR}"
+echo "[P0][gpu] VENV_DIR   : ${VENV_DIR}"
+echo "[P0][gpu] WHEELHOUSE : ${WHEELHOUSE}"
 
-VENV_DIR="${P0_VENV_DIR:-$BASE_DIR/venv/p0_env}"
-PYTHON_BIN="${P0_PYTHON:-python3}"
+test -d "${WHEELHOUSE}" || { echo "MISSING wheelhouse: ${WHEELHOUSE} (run cpu.sh first)"; exit 2; }
+test -f "${REQ_TXT}" || { echo "MISSING:${REQ_TXT}"; exit 2; }
+test -f "${CONSTRAINTS_TXT}" || { echo "MISSING:${CONSTRAINTS_TXT}"; exit 2; }
 
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-  echo "[P0] Creating venv (with --system-site-packages) at: $VENV_DIR"
-  "$PYTHON_BIN" -m venv --system-site-packages "$VENV_DIR"
+if [[ ! -d "${VENV_DIR}" ]]; then
+  echo "[P0][gpu] Creating venv at: ${VENV_DIR}"
+  python3.10 -m venv --system-site-packages "${VENV_DIR}"
 fi
 
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
+PYBIN="${VENV_DIR}/bin/python"
+PIP="${PYBIN} -m pip"
 
-# Quick sanity checks (no installs unless you explicitly request it)
-python - <<'PY'
-import torch
-print('torch:', torch.__version__)
-print('cuda available:', torch.cuda.is_available())
-if torch.cuda.is_available():
-  print('cuda device:', torch.cuda.get_device_name(0))
-PY
+echo "[P0][gpu] Installing OFFLINE from wheelhouse..."
+${PIP} install --no-index --find-links "${WHEELHOUSE}" -r "${REQ_TXT}" -c "${CONSTRAINTS_TXT}"
 
-# Install lightweight deps only if missing
-python - <<'PY'
-import importlib, sys
-need = ['numpy','pandas','PIL','tqdm','pycocotools','matplotlib']
-missing=[]
-for m in need:
-  try:
-    importlib.import_module(m)
-  except Exception:
-    missing.append(m)
-if missing:
-  print('MISSING:' + ' '.join(missing))
-  sys.exit(2)
-print('OK')
-PY
+echo "[P0][gpu] Sanity checks..."
+${PYBIN} -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'ngpu', torch.cuda.device_count())"
+${PYBIN} -c "import pycocotools; print('pycocotools OK')"
 
-if [[ $? -eq 2 ]]; then
-  if [[ "${P0_INSTALL_DEPS:-1}" == "1" ]]; then
-    echo "[P0] Installing missing lightweight deps into venv..."
-    WHEELHOUSE="${P0_WHEELHOUSE:-$BASE_DIR/data/wheels}"
-    if [[ -d "$WHEELHOUSE" ]] && compgen -G "$WHEELHOUSE/*.whl" > /dev/null; then
-      python -m pip install --no-index --find-links "$WHEELHOUSE" -r requirements.notorch.txt
-    else
-      python -m pip install -r requirements.notorch.txt
-    fi
-  else
-    echo "[P0] Missing deps detected, but P0_INSTALL_DEPS=0, aborting."
-    exit 2
-  fi
-fi
+echo "[P0][gpu] Run experiment..."
+${PYBIN} "${ROOT_DIR}/main.py" probe
+${PYBIN} -m torch.distributed.run --nproc_per_node=8 "${ROOT_DIR}/main.py" worker
+${PYBIN} "${ROOT_DIR}/main.py" analyze
+${PYBIN} "${ROOT_DIR}/main.py" summary
 
-MODEL_PATH="${P0_MODEL_PATH:-$BASE_DIR/models/Qwen3-VL-8B-Instruct}"
-COCO_ROOT="${P0_COCO_ROOT:-$BASE_DIR/data/coco}"
-GPU_NUM="${P0_GPU_NUM:-8}"
-N_SAMPLES="${P0_N_SAMPLES:-2000}"
-LAYERS=( ${P0_LAYERS:-16 20 24 28 32} )
-
-# 1) Probe
-python main.py probe \
-  --base_dir "$BASE_DIR" \
-  --model_path "$MODEL_PATH" \
-  --coco_root "$COCO_ROOT" \
-  --n_samples 8
-
-# 2) Worker (sharded automatically by torchrun env RANK/WORLD_SIZE)
-LOG_PREFIX="$BASE_DIR/logs/worker_$(date +%Y%m%d_%H%M%S)"
-
-torchrun --standalone --nproc_per_node "$GPU_NUM" \
-  main.py worker \
-  --base_dir "$BASE_DIR" \
-  --model_path "$MODEL_PATH" \
-  --coco_root "$COCO_ROOT" \
-  --device cuda \
-  --n_samples "$N_SAMPLES" \
-  --layers "${LAYERS[@]}" \
-  2>&1 | tee "${LOG_PREFIX}.log"
-
-# 3) Analyze + Summary
-python main.py analyze --base_dir "$BASE_DIR"
-python main.py summary --base_dir "$BASE_DIR"
-
-echo "[P0] Done. Results: $BASE_DIR/results  Logs: $BASE_DIR/logs"
+echo "[P0][gpu] DONE."
