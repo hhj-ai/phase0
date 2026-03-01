@@ -80,7 +80,7 @@ torchaudio==2.4.1
 
 # --- hf / vl ---
 transformers==5.2.0
-tokenizers==0.23.0
+tokenizers==0.22.2
 huggingface-hub==1.5.0
 qwen-vl-utils==0.0.14
 
