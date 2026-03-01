@@ -4,54 +4,67 @@ if [[ -z "${BASH_VERSION:-}" ]]; then exec bash "$0" "$@"; fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$ROOT_DIR/tools/common.sh"
-p0_pip_sanitize_env
+source "$ROOT_DIR/tools/bootstrap_miniforge.sh"
 
-p0_log "[gpu] ROOT_DIR   : $ROOT_DIR"
-p0_log "[gpu] WHEELHOUSE : $ROOT_DIR/offline_wheels/py310"
-p0_log "[gpu] VENV_DIR   : $ROOT_DIR/venv/p0_env"
+# -----------------------------
+# GPU env config
+# -----------------------------
+ENV_DIR="${P0_GPU_ENV_DIR:-$ROOT_DIR/venv/p0_gpu}"
+REQ_FILE="${P0_GPU_REQ_FILE:-$ROOT_DIR/requirements.gpu.txt}"
 
-# 0) bootstrap python and wheelhouse (both idempotent)
-bash "$ROOT_DIR/tools/bootstrap_python310.sh"
-bash "$ROOT_DIR/tools/build_wheelhouse.sh"
+p0_log "[gpu] ROOT_DIR : $ROOT_DIR"
+p0_log "[gpu] ENV_DIR  : $ENV_DIR"
+p0_log "[gpu] REQ_FILE : $REQ_FILE"
 
-# 1) ensure venv exists and CPU deps installed (offline)
-bash "$ROOT_DIR/tools/create_venv.sh" "$ROOT_DIR/requirements.cpu.txt" "$ROOT_DIR/constraints.cpu.txt"
+p0_require_file "$REQ_FILE"
 
-VENV_PY="$ROOT_DIR/venv/p0_env/bin/python"
-WHEELHOUSE="$ROOT_DIR/offline_wheels/py310"
+REQ_HASH="$(p0_sha256_file "$REQ_FILE")"
+STAMP_FILE="$ENV_DIR/.p0_gpu_${REQ_HASH}.stamp"
 
-# 2) Torch wheels are hosted on PyTorch index. We download them into wheelhouse once, then install offline.
-TORCH_INDEX="${P0_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
-TORCH_REQ="$ROOT_DIR/requirements.gpu.txt"
-TORCH_CON="$ROOT_DIR/constraints.gpu.txt"
-
-# Marker to avoid repeat
-MARK="$WHEELHOUSE/.torch.ok"
-fp_req="$(p0_sha256 "$TORCH_REQ")"
-fp_con="$(p0_sha256 "$TORCH_CON")"
-FP="torch_req=$fp_req torch_con=$fp_con"
-
-need_dl=1
-if [[ -f "$MARK" ]]; then
-  old="$(cat "$MARK" 2>/dev/null || true)"
-  [[ "$old" == "$FP" ]] && need_dl=0
+if [[ -f "$STAMP_FILE" && -z "${P0_FORCE:-}" ]]; then
+  p0_log "[gpu] 已安装且 requirements 未变化：跳过安装（P0_FORCE=1 可强制重装）"
+  p0_log "[gpu] 用法："
+  p0_log "      $ROOT_DIR/tools/p0_run.sh gpu python -c \"import torch; print(torch.__version__, torch.version.cuda)\""
+  exit 0
 fi
 
-if [[ "$need_dl" -eq 1 ]]; then
-  p0_log "[gpu] 下载 torch/torchvision/torchaudio wheels -> wheelhouse（只做一次）"
-  "$VENV_PY" -m pip download -r "$TORCH_REQ" -c "$TORCH_CON" -d "$WHEELHOUSE" \
-    --index-url "$TORCH_INDEX" --extra-index-url https://pypi.org/simple --isolated
-  echo -n "$FP" > "$MARK"
+# (Re)create env if missing
+if [[ ! -d "$ENV_DIR" || ! -x "$ENV_DIR/bin/python" ]]; then
+  p0_log "[gpu] 创建 conda env (python=3.10) ..."
+  p0_conda create -y -p "$ENV_DIR" python=3.10 pip
 else
-  p0_log "[gpu] torch wheels 已下载且指纹一致，跳过下载。"
+  p0_log "[gpu] conda env 已存在：$ENV_DIR"
 fi
 
-p0_log "[gpu] 从 wheelhouse 离线安装 GPU 依赖（含 torch）..."
-"$VENV_PY" -m pip install --no-index --find-links "$WHEELHOUSE" -r "$TORCH_REQ" -c "$TORCH_CON"
+export PIP_CONFIG_FILE="${PIP_CONFIG_FILE:-/dev/null}"
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PIP_NO_INPUT=1
 
-# 3) generate env_gpu.sh to fix LD_LIBRARY_PATH precedence for pip-shipped nvidia libs (if any)
-bash "$ROOT_DIR/tools/fix_ld_library_path.sh" || true
+p0_log "[gpu] 安装 PyTorch + CUDA (conda) ..."
+# This tends to be the most stable way to avoid libnvJitLink / libcusparse mismatch issues.
+# Channels order matters: pytorch, nvidia, conda-forge.
+p0_conda install -y -p "$ENV_DIR" -c pytorch -c nvidia -c conda-forge \
+  pytorch torchvision torchaudio pytorch-cuda=12.4
 
-p0_log "[gpu] DONE"
-p0_log "[gpu] 推荐跑之前执行：source ./env_gpu.sh （如果生成了的话）"
-p0_log "[gpu] 然后：./venv/p0_env/bin/python -c \"import torch; print(torch.__version__, torch.cuda.is_available())\""
+p0_log "[gpu] 安装 pycocotools (conda-forge) ..."
+p0_conda install -y -p "$ENV_DIR" -c conda-forge pycocotools
+
+p0_log "[gpu] 升级 pip/setuptools/wheel ..."
+p0_conda_run "$ENV_DIR" python -m pip install -U pip setuptools wheel --index-url https://pypi.org/simple
+
+# requirements.gpu.txt currently references requirements.cpu.txt via "-r ...".
+# Keep that behavior; just use pip for the non-torch stack.
+p0_log "[gpu] pip 安装 requirements（强制走 PyPI HTTPS）..."
+p0_conda_run "$ENV_DIR" python -m pip install -r "$REQ_FILE" --index-url https://pypi.org/simple
+
+p0_log "[gpu] 写入安装 stamp ..."
+mkdir -p "$ENV_DIR"
+rm -f "$ENV_DIR"/.p0_gpu_*.stamp || true
+date > "$STAMP_FILE"
+
+p0_log "[gpu] 记录 freeze（方便以后复现）..."
+p0_conda_run "$ENV_DIR" python -m pip freeze > "$ENV_DIR/requirements.freeze.txt" || true
+
+p0_log "[gpu] OK"
+p0_log "[gpu] 运行示例："
+p0_log "      $ROOT_DIR/tools/p0_run.sh gpu python -c \"import torch; print(torch.__version__, torch.version.cuda)\""

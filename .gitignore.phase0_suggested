@@ -1,4 +1,5 @@
 .runtime/
 venv/
 offline_wheels/
-env_gpu.sh
+__pycache__/
+*.pyc
