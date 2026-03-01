@@ -1,100 +1,134 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# gpu.sh - GPU服务器（无网）离线安装 + 8卡分片运行（不使用torchrun）
-# 修复点：
-#  1) 去掉 --model_path（p0_experiment.py 不支持这个参数）
-#  2) 不用 torchrun（p0_experiment.py 不是DDP脚本，应该用 shard_idx/num_shards）
-#  3) 每个 shard 绑定一张 GPU：CUDA_VISIBLE_DEVICES=i
-# ============================================================
+# =========================
+# GPU node (NO internet)
+# - creates venv
+# - installs from wheelhouse
+# - runs: probe + workers + analyze + summary
+# =========================
 
-SHARED="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl"
-WHEELS="$SHARED/data/wheels"
-VENV="$SHARED/venv/p0_env"
-REQ="$SHARED/code/requirements_offline.txt"
+SHARED="${P0_SHARED_DIR:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl}"
+CODE_DIR="$SHARED/code"
+DATA_DIR="$SHARED/data"
+WHEELHOUSE="${P0_WHEELHOUSE:-$DATA_DIR/wheels}"
+VENV_DIR="$SHARED/venv/p0_env"
+LOG_DIR="$SHARED/logs"
+RESULT_DIR="$SHARED/results"
 
-GPUS="${1:-8}"
+NGPU="${1:-8}"
+PYTHON_BIN="${P0_PYTHON_BIN:-python3}"
+
+MODEL_DIR="${P0_MODEL_DIR:-$DATA_DIR/models/Qwen3-VL-8B-Instruct}"
+COCO_IMG_DIR="${P0_COCO_IMG_DIR:-$DATA_DIR/datasets/coco_val2017/val2017}"
+COCO_ANN_PATH="${P0_COCO_ANN_PATH:-$DATA_DIR/datasets/coco_val2017/annotations/instances_val2017.json}"
 
 echo "================================================================"
-echo "GPU offline install + run (manual sharding)"
-echo "  SHARED: $SHARED"
-echo "  WHEELS: $WHEELS"
-echo "  GPUS  : $GPUS"
+echo "[gpu] SHARED     : $SHARED"
+echo "[gpu] CODE_DIR   : $CODE_DIR"
+echo "[gpu] WHEELHOUSE : $WHEELHOUSE"
+echo "[gpu] VENV       : $VENV_DIR"
+echo "[gpu] NGPU       : $NGPU"
 echo "================================================================"
 
-# 彻底屏蔽 pip 全局配置污染
-unset PIP_FIND_LINKS PIP_INDEX_URL PIP_EXTRA_INDEX_URL
-export PIP_CONFIG_FILE=/dev/null
+mkdir -p "$CODE_DIR" "$LOG_DIR" "$RESULT_DIR"
 
-mkdir -p "$SHARED/logs" "$SHARED/results"
-
-# 1) venv
-if [ ! -d "$VENV" ]; then
-  python3 -m venv "$VENV"
-fi
-source "$VENV/bin/activate"
-
-# 2) 离线升级基础工具链（wheelhouse里有就升；没有也不致命）
-python -m pip install --isolated --no-index --find-links "$WHEELS" -U pip setuptools wheel || true
-
-# 3) 离线安装 torch
-python -m pip install --isolated --no-index --find-links "$WHEELS" torch torchvision torchaudio
-
-# 4) nvJitLink/cusparse 动态库优先级修复（你之前那个 ImportError 就靠这个）
-SITE="$(python -c 'import site; print(site.getsitepackages()[0])')"
-NVJ="$SITE/nvidia/nvjitlink/lib"
-CUS="$SITE/nvidia/cusparse/lib"
-export LD_LIBRARY_PATH="$NVJ:$CUS:${LD_LIBRARY_PATH:-}"
-if [ -f "$NVJ/libnvJitLink.so.12" ]; then
-  export LD_PRELOAD="$NVJ/libnvJitLink.so.12:${LD_PRELOAD:-}"
-fi
-
-# 5) 离线安装其余依赖（带版本约束，确保 hub/tokenizers 满足 transformers dev）
-if [ ! -f "$REQ" ]; then
-  echo "✗ missing $REQ (请先在CPU跑 cpu.sh 生成它)"
+# 0) Sync main.py into shared/code (expects main.py next to gpu.sh)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/main.py" ]]; then
+  cp -f "$SCRIPT_DIR/main.py" "$CODE_DIR/main.py"
+else
+  echo "[gpu] ERROR: main.py not found next to gpu.sh"
   exit 1
 fi
-python -m pip install --isolated --no-index --find-links "$WHEELS" -r "$REQ"
 
-# 6) transformers（优先装 wheelhouse 里的 transformers-*.whl）
-TRANS_WHL="$(ls -t "$WHEELS"/transformers-*.whl 2>/dev/null | head -1 || true)"
-if [ -n "$TRANS_WHL" ]; then
-  python -m pip install --isolated --no-index --find-links "$WHEELS" "$TRANS_WHL"
-else
-  python -m pip install --isolated --no-index --find-links "$WHEELS" transformers
+# 1) Create venv
+if [[ ! -d "$VENV_DIR" ]]; then
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
+source "$VENV_DIR/bin/activate"
+
+REQ_FILE="$CODE_DIR/requirements.lock.txt"
+if [[ ! -f "$REQ_FILE" ]]; then
+  echo "[gpu] ERROR: $REQ_FILE not found. Run cpu.sh first."
+  exit 1
 fi
 
-echo ""
+# 2) Offline install
+python -m pip install --no-index --find-links "$WHEELHOUSE" "pip==26.0.1" "setuptools==82.0.0" "wheel==0.45.1"
+python -m pip install --no-index --find-links "$WHEELHOUSE" -r "$REQ_FILE"
+# ensure transformers is installed from wheelhouse
+python -m pip install --no-index --find-links "$WHEELHOUSE" transformers
+
+python -c "import transformers; print('transformers', transformers.__version__)"
+
+# 3) Force offline behavior for HF
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export HF_HOME="$SHARED/.hf"
+export TRANSFORMERS_CACHE="$SHARED/.hf/transformers"
+export HF_DATASETS_CACHE="$SHARED/.hf/datasets"
+
+# 4) Fix CUDA lib selection (avoid nvJitLink symbol mismatch):
+export LD_LIBRARY_PATH="$(python - <<'PY'
+import site, os, glob
+sp = site.getsitepackages()[0]
+libs=[]
+for p in glob.glob(os.path.join(sp, "nvidia", "*", "lib")):
+    libs.append(p)
+print(":".join(libs))
+PY
+):${LD_LIBRARY_PATH:-}"
+
 echo "== sanity check =="
 python - <<'PY'
-import torch, huggingface_hub, tokenizers, transformers
+import torch, transformers, huggingface_hub, tokenizers
 print("torch", torch.__version__, "cuda", torch.version.cuda, "ngpu", torch.cuda.device_count())
 print("huggingface_hub", huggingface_hub.__version__)
 print("tokenizers", tokenizers.__version__)
 print("transformers", transformers.__version__)
 PY
 
-echo ""
-echo "== run probe on GPU0 =="
-cd "$SHARED/code"
-CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
-python p0_experiment.py --mode probe > "$SHARED/logs/p0a_probe.log" 2>&1 || (echo "probe failed, see $SHARED/logs/p0a_probe.log"; exit 1)
+# 5) Probe
+echo "== run: probe =="
+python "$CODE_DIR/main.py" \
+  --base_dir "$SHARED" \
+  --model_path "$MODEL_DIR" \
+  --coco_img_dir "$COCO_IMG_DIR" \
+  --coco_ann_path "$COCO_ANN_PATH" \
+  --result_dir "$RESULT_DIR" \
+  --log_dir "$LOG_DIR" \
+  probe \
+  --device 0 \
+  --replace_mode moment_noise \
+  --noise_scale 0.15 \
+  --t_key_size 4 \
+  > "$LOG_DIR/p0a_probe.log" 2>&1
+echo "[gpu] probe log: $LOG_DIR/p0a_probe.log"
 
-echo ""
-echo "== run workers (${GPUS} shards) =="
+# 6) Workers (one per GPU, explicit sharding)
+echo "== run: workers ($NGPU shards) =="
 pids=()
-for ((i=0; i<GPUS; i++)); do
-  echo "  launch shard $i on GPU $i ..."
-  CUDA_VISIBLE_DEVICES=$i OMP_NUM_THREADS=1 \
-  python p0_experiment.py \
-    --mode worker \
+for ((i=0;i<NGPU;i++)); do
+  echo "[gpu] start worker $i"
+  CUDA_VISIBLE_DEVICES=$i \
+  python "$CODE_DIR/main.py" \
+    --base_dir "$SHARED" \
+    --model_path "$MODEL_DIR" \
+    --coco_img_dir "$COCO_IMG_DIR" \
+    --coco_ann_path "$COCO_ANN_PATH" \
+    --result_dir "$RESULT_DIR" \
+    --log_dir "$LOG_DIR" \
+    worker \
+    --device 0 \
     --shard_idx $i \
-    --num_shards $GPUS \
+    --num_shards $NGPU \
     --num_samples 400 \
-    --output_dir "$SHARED/results" \
-    --result_dir "$SHARED/results" \
-    > "$SHARED/logs/p0b_w${i}.log" 2>&1 &
+    --seed 42 \
+    --replace_mode moment_noise \
+    --noise_scale 0.15 \
+    --t_key_size 4 \
+    > "$LOG_DIR/p0b_w${i}.log" 2>&1 &
   pids+=($!)
 done
 
@@ -105,19 +139,22 @@ for pid in "${pids[@]}"; do
   fi
 done
 
-if [ "$fail" -ne 0 ]; then
-  echo "✗ some workers failed. Check logs: $SHARED/logs/p0b_w*.log"
+if [[ "$fail" -ne 0 ]]; then
+  echo "[gpu] ERROR: some workers failed. Check $LOG_DIR/p0b_w*.log"
   exit 1
 fi
 
-echo ""
-echo "== analyze =="
-python p0_experiment.py --mode analyze --result_dir "$SHARED/results" > "$SHARED/logs/p0b_analyze.log" 2>&1 \
-  || (echo "analyze failed, see $SHARED/logs/p0b_analyze.log"; exit 1)
+# 7) Analyze + summary
+echo "== run: analyze =="
+python "$CODE_DIR/main.py" --base_dir "$SHARED" --result_dir "$RESULT_DIR" --log_dir "$LOG_DIR" analyze \
+  > "$LOG_DIR/p0b_analyze.log" 2>&1
 
-echo ""
+echo "== run: summary =="
+python "$CODE_DIR/main.py" --base_dir "$SHARED" --result_dir "$RESULT_DIR" --log_dir "$LOG_DIR" summary \
+  | tee "$LOG_DIR/p0b_summary.log"
+
 echo "================================================================"
-echo "✓ DONE"
-echo "  logs   : $SHARED/logs"
-echo "  results: $SHARED/results"
+echo "[gpu] DONE"
+echo "  logs   : $LOG_DIR"
+echo "  results: $RESULT_DIR"
 echo "================================================================"

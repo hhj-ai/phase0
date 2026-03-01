@@ -1,92 +1,176 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# cpu.sh - CPU服务器（有网）下载 wheelhouse（含依赖）
-# 修复点：
-#  1) 用引号包住 'huggingface-hub>=1.3.0,<2.0'，避免 bash 把 <2.0 当重定向
-#  2) --isolated + PIP_CONFIG_FILE=/dev/null 防止旧 pip.conf / PIP_FIND_LINKS 污染
-#  3) 清理旧的 huggingface_hub 0.x / tokenizers 0.21.x 轮子，避免GPU离线装到旧版本
-# ============================================================
+# =========================
+# CPU node (has internet)
+# - downloads: model + COCO + wheels
+# - writes: $SHARED/code/main.py and $SHARED/code/requirements.lock.txt
+# =========================
 
-SHARED="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl"
-WHEELS="$SHARED/data/wheels"
-BUILD_ENV="$SHARED/venv/build_env"
+SHARED="${P0_SHARED_DIR:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl}"
+CODE_DIR="$SHARED/code"
+DATA_DIR="$SHARED/data"
+WHEELHOUSE="${P0_WHEELHOUSE:-$DATA_DIR/wheels}"
 
-TORCH_VERSION="${TORCH_VERSION:-2.4.1}"
-TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.19.1}"
-TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-2.4.1}"
-TORCH_CUDA_VERSION="${TORCH_CUDA_VERSION:-cu124}"
+MODEL_ID="${P0_MODEL_ID:-Qwen/Qwen3-VL-8B-Instruct}"
+MODEL_DIR="${P0_MODEL_DIR:-$DATA_DIR/models/Qwen3-VL-8B-Instruct}"
 
-mkdir -p "$WHEELS" "$SHARED/venv" "$SHARED/code"
+COCO_ROOT="${P0_COCO_ROOT:-$DATA_DIR/datasets/coco_val2017}"
+COCO_IMG_DIR="$COCO_ROOT/val2017"
+COCO_ANN_DIR="$COCO_ROOT/annotations"
+COCO_VAL_ZIP="$COCO_ROOT/val2017.zip"
+COCO_ANN_ZIP="$COCO_ROOT/annotations_trainval2017.zip"
+
+PYTHON_BIN="${P0_PYTHON_BIN:-python3}"
 
 echo "================================================================"
-echo "CPU wheelhouse prepare"
-echo "  SHARED   : $SHARED"
-echo "  WHEELS   : $WHEELS"
+echo "[cpu] SHARED     : $SHARED"
+echo "[cpu] WHEELHOUSE : $WHEELHOUSE"
+echo "[cpu] MODEL_DIR  : $MODEL_DIR"
+echo "[cpu] COCO_ROOT  : $COCO_ROOT"
 echo "================================================================"
 
-# 屏蔽全局 pip 配置污染
-unset PIP_FIND_LINKS PIP_INDEX_URL PIP_EXTRA_INDEX_URL
-export PIP_CONFIG_FILE=/dev/null
+mkdir -p "$CODE_DIR" "$DATA_DIR" "$WHEELHOUSE" "$COCO_ROOT" "$COCO_ANN_DIR"
 
-# 建一个干净的 venv 来下载 wheels（避免系统 pip 各种奇葩）
-python3 -m venv "$BUILD_ENV"
-source "$BUILD_ENV/bin/activate"
-python -m pip install -U pip setuptools wheel
+# 0) Copy main.py into shared/code
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/main.py" ]]; then
+  cp -f "$SCRIPT_DIR/main.py" "$CODE_DIR/main.py"
+else
+  echo "[cpu] ERROR: main.py not found next to cpu.sh"
+  exit 1
+fi
 
-echo ""
-echo "[1/4] 清理旧冲突 wheels（huggingface_hub 0.x / tokenizers 0.21.x）..."
-rm -f "$WHEELS"/huggingface_hub-0*.whl || true
-rm -f "$WHEELS"/tokenizers-0.21*.whl || true
+# 1) CPU helper venv
+CPU_VENV="$SHARED/venv/cpu_env"
+if [[ ! -d "$CPU_VENV" ]]; then
+  "$PYTHON_BIN" -m venv "$CPU_VENV"
+fi
+source "$CPU_VENV/bin/activate"
+python -m pip install -U pip setuptools wheel huggingface_hub
 
-echo ""
-echo "[2/4] 下载 torch 家族（带依赖）..."
-python -m pip download --isolated -d "$WHEELS" \
-  torch=="$TORCH_VERSION" torchvision=="$TORCHVISION_VERSION" torchaudio=="$TORCHAUDIO_VERSION" \
-  --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VERSION}" \
-  --extra-index-url "https://pypi.org/simple"
+# 2) COCO downloads (official COCO URLs)
+download_zip () {
+  local url="$1"
+  local out="$2"
+  mkdir -p "$(dirname "$out")"
+  if [[ -f "$out" ]]; then
+    echo "[cpu] zip exists: $out (skip download)"
+    return 0
+  fi
+  echo "[cpu] downloading: $url"
+  wget -c -O "$out" "$url"
+}
 
-echo ""
-echo "[3/4] 下载 transformers 依赖（注意：含 <2.0 必须加引号）..."
-# 这里不强制下载 transformers 本体（你如果用源码 wheel，就在 wheels 里放你构建的 transformers-*.whl）
-# 但依赖必须满足 transformers(main/dev) 的要求
-python -m pip download --isolated -d "$WHEELS" \
-  'huggingface-hub>=1.3.0,<2.0' \
-  'tokenizers>=0.22.0,<=0.23.0' \
-  accelerate datasets pandas numpy scipy tqdm pillow matplotlib scikit-learn pycocotools \
-  safetensors sentencepiece regex pyyaml requests packaging jinja2 filelock
+extract_zip () {
+  local zip="$1"
+  local outdir="$2"
+  mkdir -p "$outdir"
+  echo "[cpu] verifying zip: $zip"
+  unzip -t "$zip" >/dev/null
+  echo "[cpu] extracting: $zip -> $outdir"
+  unzip -q -o "$zip" -d "$outdir"
+}
 
-echo ""
-echo "[4/4] 写一份GPU侧离线安装用的 requirements_offline.txt（同样注意引号）..."
-cat > "$SHARED/code/requirements_offline.txt" <<'EOF'
-# --- core ---
-accelerate
-datasets
-pandas
-numpy
-scipy
-tqdm
-pillow
-matplotlib
-scikit-learn
-pycocotools
-safetensors
-sentencepiece
-regex
-pyyaml
-requests
-packaging
-jinja2
-filelock
-# --- transformers main/dev compatible ---
-huggingface-hub>=1.3.0,<2.0
-tokenizers>=0.22.0,<=0.23.0
+if [[ ! -d "$COCO_IMG_DIR" || -z "$(ls -A "$COCO_IMG_DIR" 2>/dev/null || true)" ]]; then
+  download_zip "http://images.cocodataset.org/zips/val2017.zip" "$COCO_VAL_ZIP"
+  extract_zip "$COCO_VAL_ZIP" "$COCO_ROOT"
+else
+  echo "[cpu] COCO images already present: $COCO_IMG_DIR"
+fi
+
+if [[ ! -f "$COCO_ANN_DIR/instances_val2017.json" ]]; then
+  download_zip "http://images.cocodataset.org/annotations/annotations_trainval2017.zip" "$COCO_ANN_ZIP"
+  extract_zip "$COCO_ANN_ZIP" "$COCO_ROOT"
+fi
+
+# 3) Model snapshot (Hugging Face) if missing
+if [[ ! -d "$MODEL_DIR" || -z "$(ls -A "$MODEL_DIR" 2>/dev/null || true)" ]]; then
+  echo "[cpu] snapshot_download model: $MODEL_ID -> $MODEL_DIR"
+  export P0_MODEL_ID="$MODEL_ID"
+  export P0_MODEL_DIR="$MODEL_DIR"
+  python - <<PY
+import os
+from huggingface_hub import snapshot_download
+model_id = os.environ.get("P0_MODEL_ID", "Qwen/Qwen3-VL-8B-Instruct")
+local_dir = os.environ.get("P0_MODEL_DIR", os.environ.get("MODEL_DIR"))
+os.makedirs(local_dir, exist_ok=True)
+snapshot_download(repo_id=model_id, local_dir=local_dir, local_dir_use_symlinks=False, resume_download=True)
+print("done:", local_dir)
+PY
+else
+  echo "[cpu] model already present: $MODEL_DIR"
+fi
+
+# 4) Wheelhouse for GPU offline install
+REQ_FILE="$CODE_DIR/requirements.lock.txt"
+cat > "$REQ_FILE" <<'EOF'
+pip==26.0.1
+setuptools==82.0.0
+wheel==0.45.1
+
+torch==2.4.1+cu124
+
+huggingface_hub==1.5.0
+tokenizers==0.22.2
+qwen-vl-utils==0.0.10
+safetensors==0.5.2
+sentencepiece==0.2.0
+
+numpy==1.26.4
+scipy==1.15.0
+pandas==2.2.3
+pillow==11.0.0
+tqdm==4.67.1
+pyyaml==6.0.2
+requests==2.32.3
+filelock==3.16.1
+packaging==24.2
+jinja2==3.1.4
+
+matplotlib==3.10.0
+scikit-learn==1.5.2
+opencv-python-headless==4.10.0.84
 EOF
 
-echo ""
+echo "[cpu] requirements written: $REQ_FILE"
+
+echo "[cpu] downloading torch wheels (cu124) into wheelhouse..."
+python -m pip download -d "$WHEELHOUSE" --extra-index-url https://download.pytorch.org/whl/cu124 "torch==2.4.1+cu124"
+
+echo "[cpu] downloading PyPI wheels into wheelhouse (excluding torch)..."
+WHEELHOUSE="$WHEELHOUSE" REQ_FILE="$REQ_FILE" python - <<'PY'
+import os, subprocess, sys, pathlib
+wheelhouse=os.environ["WHEELHOUSE"]
+req_file=os.environ["REQ_FILE"]
+lines=pathlib.Path(req_file).read_text().splitlines()
+keep=[]
+for ln in lines:
+    ln=ln.strip()
+    if not ln or ln.startswith("#"):
+        continue
+    if ln.startswith("torch=="):
+        continue
+    keep.append(ln)
+tmp=pathlib.Path(req_file).with_suffix(".pypi.tmp.txt")
+tmp.write_text("\n".join(keep)+"\n")
+subprocess.check_call([sys.executable, "-m", "pip", "download", "-d", wheelhouse, "-r", str(tmp)])
+print("done")
+PY
+
+# transformers wheel: use existing if present; else build from git
+if ! ls "$WHEELHOUSE"/transformers-*.whl >/dev/null 2>&1; then
+  echo "[cpu] transformers wheel not found; building from git..."
+  python -m pip wheel -w "$WHEELHOUSE" "git+https://github.com/huggingface/transformers.git"
+else
+  echo "[cpu] transformers wheel already present; skip build"
+fi
+
 echo "================================================================"
-echo "✓ CPU done."
-echo "  wheelhouse: $WHEELS"
-echo "  req file  : $SHARED/code/requirements_offline.txt"
+echo "[cpu] DONE"
+echo "  code      : $CODE_DIR/main.py"
+echo "  req       : $REQ_FILE"
+echo "  wheelhouse: $WHEELHOUSE"
+echo "  model     : $MODEL_DIR"
+echo "  coco      : $COCO_ROOT"
 echo "================================================================"
