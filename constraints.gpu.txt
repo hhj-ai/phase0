@@ -1,3 +1,1 @@
-# GPU-side constraints
-pip<25
-setuptools<83
+-c constraints.cpu.txt
