@@ -2,22 +2,25 @@
 set -euo pipefail
 
 # ============================================================
-# P0 CPU bootstrap (with internet)
-# - Sync code to shared dir
-# - Download model + COCO val2017
-# - Build offline wheelhouse for Python 3.10 / manylinux2014
+# P0 CPU downloader (official sources only)
+# - Downloads: wheelhouse (py310), COCO val2017 + annotations
+# - Syncs code (main.py) into $BASE_DIR/code
 # ============================================================
 
 BASE_DIR="${P0_BASE_DIR:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl}"
+
 CODE_DIR="$BASE_DIR/code"
 DATA_DIR="$BASE_DIR/data"
-WHEELHOUSE="${P0_WHEELHOUSE:-$DATA_DIR/wheels}"
-
+WHEELHOUSE="$DATA_DIR/wheels"
 MODEL_DIR="$DATA_DIR/models/Qwen3-VL-8B-Instruct"
 COCO_ROOT="$DATA_DIR/datasets/coco_val2017"
 COCO_IMG_DIR="$COCO_ROOT/val2017"
 COCO_ANN_DIR="$COCO_ROOT/annotations"
 COCO_ANN_PATH="$COCO_ANN_DIR/instances_val2017.json"
+
+# Official package indexes (NO internal mirrors)
+PYPI_INDEX="https://pypi.org/simple"
+TORCH_INDEX_CU124="https://download.pytorch.org/whl/cu124"
 
 echo "================================================================"
 echo "[cpu] BASE_DIR    : $BASE_DIR"
@@ -27,153 +30,164 @@ echo "[cpu] MODEL_DIR   : $MODEL_DIR"
 echo "[cpu] COCO_ROOT   : $COCO_ROOT"
 echo "================================================================"
 
-mkdir -p "$CODE_DIR" "$DATA_DIR" "$WHEELHOUSE" "$COCO_ROOT" "$COCO_ANN_DIR"
+mkdir -p "$CODE_DIR" "$WHEELHOUSE" "$COCO_ROOT" "$DATA_DIR/models" "$DATA_DIR/datasets"
 
-# ------------------------------------------------------------
-# 0) Sync code to shared dir
-# ------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# -------------------------------
+# 0) Sync code
+# -------------------------------
 echo "[cpu] syncing code -> $CODE_DIR"
-cp -f "$SCRIPT_DIR/main.py" "$CODE_DIR/main.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/main.py" ]]; then
+  cp -f "$SCRIPT_DIR/main.py" "$CODE_DIR/main.py"
+else
+  echo "[cpu] WARNING: main.py not found next to cpu.sh. You must copy main.py into $CODE_DIR manually."
+fi
 
-# ------------------------------------------------------------
-# 1) Write requirements (single source of truth for GPU offline install)
-# ------------------------------------------------------------
+# -------------------------------
+# 1) Write pinned requirements
+# -------------------------------
 REQ_NOTORCH="$CODE_DIR/requirements.notorch.txt"
 REQ_LOCK="$CODE_DIR/requirements.lock.txt"
 
-cat > "$REQ_NOTORCH" << 'EOF'
-# Core runtime
+cat > "$REQ_NOTORCH" <<'REQEOF'
+# NOTE: torch is installed separately from the official PyTorch index.
 transformers==5.2.0
 tokenizers==0.22.2
-huggingface-hub==1.5.0
-safetensors==0.5.2
-sentencepiece==0.2.0
-einops==0.8.0
+huggingface_hub==1.5.0
 qwen-vl-utils==0.0.10
 
-# Data / eval
+# common runtime deps
 numpy==1.26.4
 pandas==2.2.3
-scipy==1.15.0
-scikit-learn==1.5.2
-matplotlib==3.10.0
 pillow==11.0.0
-pycocotools==2.0.7
-
-# Utilities
-requests==2.32.3
-pyyaml==6.0.2
-protobuf==5.29.3
+matplotlib==3.10.0
 tqdm==4.67.1
+scikit-learn==1.5.2
+scipy==1.15.0
+pycocotools==2.0.7
+protobuf==5.29.3
+pyyaml==6.0.2
+requests==2.32.3
+einops==0.8.0
 filelock==3.16.1
-jinja2==3.1.4
 packaging==24.2
-EOF
+jinja2==3.1.4
+fsspec==2024.10.0
+typing_extensions==4.12.2
+regex==2024.11.6
+safetensors==0.5.2
+sentencepiece==0.2.0
+REQEOF
 
-cat > "$REQ_LOCK" << 'EOF'
-# Torch family (CUDA 12.4 build comes from PyTorch wheel index; version string is torch==2.4.1)
-torch==2.4.1
-torchvision==0.19.1
-torchaudio==2.4.1
-
--r requirements.notorch.txt
-EOF
+# lock == notorch (we keep one lock file to install on GPU)
+cp -f "$REQ_NOTORCH" "$REQ_LOCK"
 
 echo "[cpu] requirements written:"
 echo "  - $REQ_NOTORCH"
 echo "  - $REQ_LOCK"
 
-# ------------------------------------------------------------
-# 2) Force official PyPI (avoid any site-wide custom index)
-# ------------------------------------------------------------
-export PIP_DISABLE_PIP_VERSION_CHECK=1
-export PIP_NO_CACHE_DIR=1
+# -------------------------------
+# 2) Clean obviously wrong wheels
+# -------------------------------
+echo "[cpu] cleaning mismatched wheels (drop cp38 only; keep abi3) ..."
+find "$WHEELHOUSE" -maxdepth 1 -type f -name '*cp38*' -print -delete || true
 
-PIP_PY="$(command -v python3 || true)"
-if [[ -z "$PIP_PY" ]]; then
-  echo "[cpu] ERROR: python3 not found" >&2
-  exit 1
+# -------------------------------
+# 3) Download wheelhouse (py310)
+# -------------------------------
+echo "[cpu] downloading wheels for target: py310 manylinux2014_x86_64 ..."
+
+# Use pip download with target python/platform so the CPU host python version doesn't matter.
+PYDL_FLAGS=(
+  "--dest" "$WHEELHOUSE"
+  "--only-binary=:all:"
+  "--platform" "manylinux2014_x86_64"
+  "--implementation" "cp"
+  "--python-version" "310"
+  "--abi" "cp310"
+  "--index-url" "$PYPI_INDEX"
+  "--trusted-host" "pypi.org"
+  "--trusted-host" "files.pythonhosted.org"
+)
+
+python -m pip download "${PYDL_FLAGS[@]}" -r "$REQ_LOCK"
+
+# Download torch (+ CUDA deps) from the official torch index.
+# IMPORTANT: Use torch==2.4.1 (no "+cu124" in spec); the cu124 index provides the CUDA build.
+echo "[cpu] downloading torch (+ CUDA deps) from official PyTorch index (cu124)..."
+python -m pip download \
+  --dest "$WHEELHOUSE" \
+  --only-binary=:all: \
+  --platform manylinux2014_x86_64 \
+  --implementation cp \
+  --python-version 310 \
+  --abi cp310 \
+  --index-url "$TORCH_INDEX_CU124" \
+  --extra-index-url "$PYPI_INDEX" \
+  --trusted-host "download.pytorch.org" \
+  --trusted-host "pypi.org" \
+  --trusted-host "files.pythonhosted.org" \
+  "torch==2.4.1"
+
+# -------------------------------
+# 4) COCO val2017 + annotations
+# -------------------------------
+echo "[cpu] preparing COCO val2017 ..."
+mkdir -p "$COCO_ROOT" "$COCO_ANN_DIR"
+
+download_if_missing () {
+  local url="$1"
+  local out="$2"
+  if [[ -f "$out" ]]; then
+    echo "[cpu] exists: $out"
+    return 0
+  fi
+  echo "[cpu] downloading: $url"
+  curl -L --retry 5 --retry-delay 3 -o "$out" "$url"
+}
+
+if [[ ! -d "$COCO_IMG_DIR" || ! -f "$COCO_ANN_PATH" ]]; then
+  TMPDIR="$COCO_ROOT/.tmp"
+  mkdir -p "$TMPDIR"
+  VAL_ZIP="$TMPDIR/val2017.zip"
+  ANN_ZIP="$TMPDIR/annotations_trainval2017.zip"
+
+  download_if_missing "http://images.cocodataset.org/zips/val2017.zip" "$VAL_ZIP"
+  download_if_missing "http://images.cocodataset.org/annotations/annotations_trainval2017.zip" "$ANN_ZIP"
+
+  echo "[cpu] unzipping val2017..."
+  mkdir -p "$COCO_ROOT"
+  unzip -q -n "$VAL_ZIP" -d "$COCO_ROOT"
+  echo "[cpu] unzipping annotations..."
+  unzip -q -n "$ANN_ZIP" -d "$COCO_ROOT"
+
+  if [[ ! -d "$COCO_IMG_DIR" ]]; then
+    echo "[cpu] ERROR: val2017 not found after unzip: $COCO_IMG_DIR" >&2
+    exit 1
+  fi
+  if [[ ! -f "$COCO_ANN_PATH" ]]; then
+    echo "[cpu] ERROR: instances_val2017.json not found after unzip: $COCO_ANN_PATH" >&2
+    exit 1
+  fi
+else
+  echo "[cpu] COCO already present: $COCO_IMG_DIR"
 fi
 
-# ------------------------------------------------------------
-# 3) Build wheelhouse for target (py310, manylinux2014_x86_64)
-# ------------------------------------------------------------
-TARGET_PYVER="310"
-TARGET_PLATFORM="manylinux2014_x86_64"
-
-echo "[cpu] cleaning mismatched wheels (keep cp310 only)..."
-find "$WHEELHOUSE" -maxdepth 1 -type f \( -name '*cp38*' -o -name '*cp39*' -o -name '*cp311*' -o -name '*cp312*' \) -print -delete || true
-
-echo "[cpu] downloading torch wheels (cu124) into wheelhouse..."
-"$PIP_PY" -m pip download \
-  -d "$WHEELHOUSE" \
-  --only-binary=:all: \
-  --platform "$TARGET_PLATFORM" \
-  --python-version "$TARGET_PYVER" \
-  --implementation cp \
-  --abi cp310 \
-  --index-url https://download.pytorch.org/whl/cu124 \
-  --extra-index-url https://pypi.org/simple \
-  "torch==2.4.1" "torchvision==0.19.1" "torchaudio==2.4.1"
-
-echo "[cpu] downloading remaining wheels from PyPI..."
-"$PIP_PY" -m pip download \
-  -d "$WHEELHOUSE" \
-  --only-binary=:all: \
-  --platform "$TARGET_PLATFORM" \
-  --python-version "$TARGET_PYVER" \
-  --implementation cp \
-  --abi cp310 \
-  -i https://pypi.org/simple \
-  -r "$REQ_NOTORCH"
-
-echo "[cpu] wheelhouse ready: $(ls -1 "$WHEELHOUSE" | wc -l) files"
-
-# ------------------------------------------------------------
-# 4) Download model (Hugging Face)
-# ------------------------------------------------------------
-if [[ -f "$MODEL_DIR/config.json" ]]; then
+# -------------------------------
+# 5) Model check (download is optional)
+# -------------------------------
+if [[ -d "$MODEL_DIR" ]]; then
   echo "[cpu] model already present: $MODEL_DIR"
 else
-  echo "[cpu] installing huggingface-cli..."
-  "$PIP_PY" -m pip install -i https://pypi.org/simple -U "huggingface_hub[cli]==1.5.0"
-  echo "[cpu] downloading model -> $MODEL_DIR"
-  huggingface-cli download "Qwen/Qwen3-VL-8B-Instruct" \
-    --local-dir "$MODEL_DIR" \
-    --local-dir-use-symlinks False
-fi
-
-# ------------------------------------------------------------
-# 5) Download COCO val2017 (images + annotations)
-# ------------------------------------------------------------
-mkdir -p "$COCO_IMG_DIR" "$COCO_ANN_DIR"
-
-if [[ -f "$COCO_ANN_PATH" ]]; then
-  echo "[cpu] COCO annotations already present: $COCO_ANN_PATH"
-else
-  echo "[cpu] downloading COCO annotations..."
-  TMP_ZIP="$COCO_ROOT/annotations_trainval2017.zip"
-  wget -O "$TMP_ZIP" -c "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-  unzip -o "$TMP_ZIP" -d "$COCO_ROOT"
-  rm -f "$TMP_ZIP"
-fi
-
-if [[ -d "$COCO_IMG_DIR" ]] && [[ "$(ls -1 "$COCO_IMG_DIR" 2>/dev/null | wc -l)" -gt 10 ]]; then
-  echo "[cpu] COCO val images already present: $COCO_IMG_DIR"
-else
-  echo "[cpu] downloading COCO val2017 images..."
-  TMP_ZIP="$COCO_ROOT/val2017.zip"
-  wget -O "$TMP_ZIP" -c "http://images.cocodataset.org/zips/val2017.zip"
-  unzip -o "$TMP_ZIP" -d "$COCO_ROOT"
-  rm -f "$TMP_ZIP"
+  echo "[cpu] WARNING: model dir not found: $MODEL_DIR"
+  echo "[cpu] This script does NOT auto-download the model by default."
+  echo "[cpu] Place Qwen3-VL-8B-Instruct under: $MODEL_DIR"
 fi
 
 echo "================================================================"
-echo "✓ CPU bootstrap done."
-echo "  code      : $CODE_DIR/main.py"
-echo "  wheelhouse : $WHEELHOUSE"
-echo "  model      : $MODEL_DIR"
-echo "  coco imgs  : $COCO_IMG_DIR"
-echo "  coco ann   : $COCO_ANN_PATH"
+echo "[cpu] DONE"
+echo "  - code synced to: $CODE_DIR"
+echo "  - wheelhouse     : $WHEELHOUSE"
+echo "  - COCO img dir   : $COCO_IMG_DIR"
+echo "  - COCO ann path  : $COCO_ANN_PATH"
 echo "================================================================"
