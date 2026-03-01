@@ -33,7 +33,7 @@ COCO_ANN_PATH="${P0_COCO_ANN_PATH:-$DATA_DIR/datasets/coco_val2017/annotations/i
 # 是否强制重建 venv（0/1）
 FORCE_RECREATE_VENV="${FORCE_RECREATE_VENV:-0}"
 # 是否清理旧结果（0/1）
-CLEAN_OLD_RESULTS="${CLEAN_OLD_RESULTS:-0}"
+CLEAN_OLD_RESULTS="${CLEAN_OLD_RESULTS:-1}"
 
 echo "================================================================"
 echo "[gpu] SHARED     : $SHARED"
@@ -54,6 +54,26 @@ fi
 
 REQ_LOCK="$CODE_DIR/requirements.lock.txt"
 MAIN_PY="$CODE_DIR/main.py"
+
+# ---- ensure we are using the patched main.py ----
+# if a main.py is present next to this script, copy it into $CODE_DIR/main.py
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/main.py" ]; then
+  cp -f "$SCRIPT_DIR/main.py" "$CODE_DIR/main.py"
+elif [ -f "$SCRIPT_DIR/main_v4.py" ]; then
+  cp -f "$SCRIPT_DIR/main_v4.py" "$CODE_DIR/main.py"
+fi
+if ! grep -q "local_rank_env" "$MAIN_PY"; then
+  echo "[gpu] ERROR: $MAIN_PY is NOT the patched version (missing local_rank_env)."
+  echo "[gpu] Please overwrite $CODE_DIR/main.py with the new file and retry."
+  exit 2
+fi
+
+# ---- optional: show GPU free memory snapshot ----
+if command -v nvidia-smi >/dev/null 2>&1; then
+  echo "[gpu] nvidia-smi memory snapshot:"
+  nvidia-smi --query-gpu=index,memory.total,memory.used,memory.free --format=csv,noheader || true
+fi
 
 if [ ! -f "$REQ_LOCK" ]; then
   echo "[gpu] ERROR: requirements.lock.txt not found at: $REQ_LOCK"

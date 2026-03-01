@@ -24,7 +24,7 @@ COCO_ROOT="$DATA_DIR/datasets/coco_val2017"
 CODE_DIR="$SHARED/code"
 
 # 是否清理旧结果(只删 results/logs 里 p0a/p0b 的产物，不动数据/模型)
-CLEAN_OLD_RESULTS="${CLEAN_OLD_RESULTS:-0}"
+CLEAN_OLD_RESULTS="${CLEAN_OLD_RESULTS:-1}"
 
 # ----------------------------
 # 强制官方 pip 源（忽略系统 pip.conf / 环境变量）
@@ -63,9 +63,16 @@ fi
 # 0) 同步代码到共享目录（方便 GPU 直接跑）
 # ----------------------------
 echo "[cpu] syncing code -> $CODE_DIR"
-cp -f "$SCRIPT_DIR/main.py" "$CODE_DIR/main.py"
-cp -f "$SCRIPT_DIR/gpu.sh"  "$CODE_DIR/gpu.sh"
-cp -f "$SCRIPT_DIR/cpu.sh"  "$CODE_DIR/cpu.sh" 2>/dev/null || true
+MAIN_SRC="$SCRIPT_DIR/main.py"
+GPU_SRC="$SCRIPT_DIR/gpu.sh"
+CPU_SRC="$SCRIPT_DIR/cpu.sh"
+# allow alternative filenames when you download as *_v4
+if [ ! -f "$MAIN_SRC" ] && [ -f "$SCRIPT_DIR/main_v4.py" ]; then MAIN_SRC="$SCRIPT_DIR/main_v4.py"; fi
+if [ ! -f "$GPU_SRC" ] && [ -f "$SCRIPT_DIR/gpu_v4.sh" ]; then GPU_SRC="$SCRIPT_DIR/gpu_v4.sh"; fi
+if [ ! -f "$CPU_SRC" ] && [ -f "$SCRIPT_DIR/cpu_v4.sh" ]; then CPU_SRC="$SCRIPT_DIR/cpu_v4.sh"; fi
+cp -f "$MAIN_SRC" "$CODE_DIR/main.py"
+cp -f "$GPU_SRC"  "$CODE_DIR/gpu.sh"
+cp -f "$CPU_SRC"  "$CODE_DIR/cpu.sh" 2>/dev/null || true
 
 # ----------------------------
 # 1) 写 requirements（锁住关键项）
