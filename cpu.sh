@@ -2,170 +2,224 @@
 set -euo pipefail
 
 # =========================
-# P0 CPU bootstrap (official sources)
-# - sync code to SHARED/code
-# - download COCO val2017
-# - download model (optional, if missing)
-# - download wheels into SHARED/data/wheels for offline GPU install
+# P0 CPU (online) bootstrap
 # =========================
+# - Sync code (main.py) to shared directory
+# - Download/prepare:
+#   * wheelhouse (for GPU offline install, Python 3.10)
+#   * Qwen3-VL model snapshot
+#   * COCO val2017 (images + instances_val2017.json)
+#
+# You can override BASE_DIR by:
+#   BASE_DIR=/path/to/p0_qwen3vl bash cpu.sh
 
-# -------- Hardcoded project root --------
-SHARED="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl"
+BASE_DIR="${BASE_DIR:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl}"
 
-CODE_DIR="$SHARED/code"
-DATA_DIR="$SHARED/data"
+CODE_DIR="$BASE_DIR/code"
+DATA_DIR="$BASE_DIR/data"
 WHEELHOUSE="$DATA_DIR/wheels"
 MODEL_DIR="$DATA_DIR/models/Qwen3-VL-8B-Instruct"
-
 COCO_ROOT="$DATA_DIR/datasets/coco_val2017"
 COCO_IMG_DIR="$COCO_ROOT/val2017"
 COCO_ANN_DIR="$COCO_ROOT/annotations"
 COCO_ANN_PATH="$COCO_ANN_DIR/instances_val2017.json"
 
+PIP_PYPI="https://pypi.org/simple"
+TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+
+# Target GPU env: Python 3.10 on Linux x86_64
+DL_FLAGS=(
+  --only-binary=:all:
+  --platform manylinux2014_x86_64
+  --python-version 3.10
+  --implementation cp
+  --abi cp310
+  --abi abi3
+)
+
 echo "================================================================"
-echo "[cpu] SHARED      : $SHARED"
+echo "[cpu] BASE_DIR    : $BASE_DIR"
 echo "[cpu] CODE_DIR    : $CODE_DIR"
 echo "[cpu] WHEELHOUSE  : $WHEELHOUSE"
 echo "[cpu] MODEL_DIR   : $MODEL_DIR"
 echo "[cpu] COCO_ROOT   : $COCO_ROOT"
 echo "================================================================"
 
-mkdir -p "$CODE_DIR" "$WHEELHOUSE" "$MODEL_DIR" "$COCO_ROOT" "$COCO_ANN_DIR"
+mkdir -p "$CODE_DIR" "$WHEELHOUSE" "$DATA_DIR/models" "$DATA_DIR/datasets"
 
-# -------- Sync code (expects main.py/cpu.sh/gpu.sh in the same folder as this script) --------
+# -------------------------
+# 1) Sync code
+# -------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "$SCRIPT_DIR/main.py" ]]; then
+  echo "[cpu][FATAL] main.py not found next to cpu.sh (expected: $SCRIPT_DIR/main.py)" >&2
+  exit 1
+fi
+
 echo "[cpu] syncing code -> $CODE_DIR"
 cp -f "$SCRIPT_DIR/main.py" "$CODE_DIR/main.py"
-cp -f "$SCRIPT_DIR/cpu.sh"  "$CODE_DIR/cpu.sh"  || true
-cp -f "$SCRIPT_DIR/gpu.sh"  "$CODE_DIR/gpu.sh"  || true
-chmod +x "$CODE_DIR/"*.sh || true
 
-# -------- Write requirements (pin versions that exist on PyPI) --------
+# -------------------------
+# 2) Write requirements
+# -------------------------
 REQ_NO_TORCH="$CODE_DIR/requirements.notorch.txt"
 REQ_LOCK="$CODE_DIR/requirements.lock.txt"
 
-cat > "$REQ_NO_TORCH" <<'REQ'
-# Core runtime (pin to known-good versions)
+cat > "$REQ_NO_TORCH" <<'EOF'
+# ==== Core runtime ====
 transformers==5.2.0
 tokenizers==0.22.2
 huggingface-hub==1.5.0
-safetensors>=0.4.3
-accelerate>=0.30.0
-# vision/io
-pillow>=10.3.0
-opencv-python-headless>=4.9.0.80
-# data
+safetensors>=0.5.2
+accelerate>=0.34.0
+sentencepiece>=0.2.0
+
+# ==== Vision / data / eval ====
+pillow>=10.4.0
 numpy>=1.26.4
-pandas>=2.2.2
-tqdm>=4.66.4
-pyyaml>=6.0.1
-requests>=2.32.3
-# plotting (optional, but nice for p0b_hist)
-matplotlib>=3.8.4
-# Qwen VL helper (if your code uses it)
-qwen-vl-utils>=0.0.8
-REQ
+scipy>=1.10.1
+pandas>=2.0.3
+matplotlib>=3.7.5
+scikit-learn>=1.3.2
+pycocotools>=2.0.7
+tqdm>=4.67.1
+einops>=0.8.0
 
-cat > "$REQ_LOCK" <<'REQ'
-# Torch stack (use PyTorch CUDA12.4 index to get the right wheels)
-torch==2.4.1
-# optional: torchvision/torchaudio if needed
-# torchvision==0.19.1
-# torchaudio==2.4.1
-REQ
+# Qwen utils (if needed by processor)
+qwen-vl-utils>=0.0.10
+EOF
 
-# append the no-torch stack
-cat "$REQ_NO_TORCH" >> "$REQ_LOCK"
+# Lock file includes torch
+cat > "$REQ_LOCK" <<'EOF'
+torch==2.4.1+cu124
+# (optional) torchvision/torchaudio are not required for this P0,
+# but can be useful. Uncomment if you want them in the wheelhouse.
+# torchvision==0.19.1+cu124
+# torchaudio==2.4.1+cu124
+
+# Mirror the rest:
+transformers==5.2.0
+tokenizers==0.22.2
+huggingface-hub==1.5.0
+safetensors>=0.5.2
+accelerate>=0.34.0
+sentencepiece>=0.2.0
+pillow>=10.4.0
+numpy>=1.26.4
+scipy>=1.10.1
+pandas>=2.0.3
+matplotlib>=3.7.5
+scikit-learn>=1.3.2
+pycocotools>=2.0.7
+tqdm>=4.67.1
+einops>=0.8.0
+qwen-vl-utils>=0.0.10
+EOF
 
 echo "[cpu] requirements written:"
 echo "  - $REQ_NO_TORCH"
 echo "  - $REQ_LOCK"
 
-# -------- Clean mismatched wheels (keep cp310) --------
-echo "[cpu] cleaning mismatched torch wheels (keep cp310)..."
-find "$WHEELHOUSE" -maxdepth 1 -type f \( -name "*cp38*.whl" -o -name "*cp39*.whl" -o -name "*cp311*.whl" -o -name "*cp312*.whl" \) -print -delete || true
-
-# -------- Ensure pip tooling is present --------
-PYTHON_BIN="${PYTHON_BIN:-python3.10}"
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  PYTHON_BIN="python3"
+# -------------------------
+# 3) Download wheels (official indices)
+# -------------------------
+PYTHON_BIN="$(command -v python3.10 || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="$(command -v python3 || true)"
 fi
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "[cpu][FATAL] python3 not found" >&2
+  exit 1
+fi
+echo "[cpu] python: $PYTHON_BIN"
 
-# Always force official sources (ignore any global pip.conf mirror)
-PIP_PYPI="https://pypi.org/simple"
-PIP_TORCH_CU124="https://download.pytorch.org/whl/cu124"
-
-echo "[cpu] downloading bootstrap wheels (pip/setuptools/wheel) from PyPI..."
+# Download pip/setuptools/wheel for GPU venv upgrade (avoid CPU python version constraints)
+echo "[cpu] downloading bootstrap wheels (pip/setuptools/wheel) from PyPI for py3.10..."
 "$PYTHON_BIN" -m pip download -d "$WHEELHOUSE" \
-  --only-binary=:all: --no-deps \
+  "${DL_FLAGS[@]}" \
+  --no-deps \
+  --ignore-requires-python \
   --index-url "$PIP_PYPI" \
-  "pip==26.0.1" "setuptools==82.0.0" "wheel==0.45.1"
+  "pip==26.0.1" "setuptools==82.0.0" "wheel==0.43.0"
 
-echo "[cpu] downloading torch wheels (CUDA 12.4) into wheelhouse..."
+# Torch (and deps) from official PyTorch index (cu124)
+echo "[cpu] downloading torch wheels (cu124) into wheelhouse..."
 "$PYTHON_BIN" -m pip download -d "$WHEELHOUSE" \
-  --only-binary=:all: \
-  --platform manylinux2014_x86_64 --python-version 310 --implementation cp --abi cp310 \
-  --index-url "$PIP_TORCH_CU124" --extra-index-url "$PIP_PYPI" \
-  -r "$REQ_LOCK"
+  "${DL_FLAGS[@]}" \
+  --index-url "$TORCH_INDEX" \
+  --extra-index-url "$PIP_PYPI" \
+  "torch==2.4.1+cu124"
 
-echo "[cpu] downloading remaining wheels (no-torch) into wheelhouse..."
+# Everything else from PyPI (py310 wheels)
+echo "[cpu] downloading remaining wheels into wheelhouse..."
 "$PYTHON_BIN" -m pip download -d "$WHEELHOUSE" \
-  --only-binary=:all: \
-  --platform manylinux2014_x86_64 --python-version 310 --implementation cp --abi cp310 \
+  "${DL_FLAGS[@]}" \
   --index-url "$PIP_PYPI" \
   -r "$REQ_NO_TORCH"
 
-echo "[cpu] wheelhouse size: $(ls -1 "$WHEELHOUSE" | wc -l) files"
+echo "[cpu] wheelhouse ready: $WHEELHOUSE"
+echo "[cpu] (note) if you previously downloaded cp38/cp39 wheels, you may keep them; GPU install uses --only-binary and will pick compatible ones."
 
-# -------- Download COCO val2017 (official COCO host) --------
-download_and_unzip () {
-  local url="$1"
-  local zip_path="$2"
-  local dst_dir="$3"
-
-  if [ -d "$dst_dir" ] && [ "$(find "$dst_dir" -maxdepth 1 -type f | wc -l)" -gt 10 ]; then
-    echo "[cpu] already present: $dst_dir"
-    return
-  fi
-
-  mkdir -p "$(dirname "$zip_path")"
-  echo "[cpu] downloading: $url"
-  curl -L --retry 5 --retry-delay 2 -o "$zip_path" "$url"
-
-  echo "[cpu] testing zip: $zip_path"
-  unzip -t "$zip_path" >/dev/null
-
-  echo "[cpu] extracting -> $dst_dir"
-  unzip -q "$zip_path" -d "$COCO_ROOT"
-}
-
-download_and_unzip "https://images.cocodataset.org/zips/val2017.zip" "$COCO_ROOT/val2017.zip" "$COCO_IMG_DIR"
-
-if [ ! -f "$COCO_ANN_PATH" ]; then
-  echo "[cpu] downloading COCO annotations..."
-  curl -L --retry 5 --retry-delay 2 -o "$COCO_ROOT/annotations_trainval2017.zip" \
-    "https://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-  unzip -q "$COCO_ROOT/annotations_trainval2017.zip" -d "$COCO_ROOT"
+# -------------------------
+# 4) Download COCO val2017 (official)
+# -------------------------
+mkdir -p "$COCO_ROOT" "$COCO_ANN_DIR"
+if [[ ! -d "$COCO_IMG_DIR" ]] || [[ -z "$(ls -A "$COCO_IMG_DIR" 2>/dev/null || true)" ]]; then
+  echo "[cpu] downloading COCO val2017 images..."
+  mkdir -p "$COCO_ROOT/tmp"
+  VAL_ZIP="$COCO_ROOT/tmp/val2017.zip"
+  wget -c -O "$VAL_ZIP" "https://images.cocodataset.org/zips/val2017.zip"
+  unzip -q -o "$VAL_ZIP" -d "$COCO_ROOT"
+  rm -f "$VAL_ZIP"
+else
+  echo "[cpu] COCO images already present: $COCO_IMG_DIR"
 fi
 
-# -------- Optional: download model from HF if missing --------
-if [ -f "$MODEL_DIR/config.json" ]; then
+if [[ ! -f "$COCO_ANN_PATH" ]]; then
+  echo "[cpu] downloading COCO annotations..."
+  mkdir -p "$COCO_ROOT/tmp"
+  ANN_ZIP="$COCO_ROOT/tmp/annotations_trainval2017.zip"
+  wget -c -O "$ANN_ZIP" "https://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+  unzip -q -o "$ANN_ZIP" -d "$COCO_ROOT"
+  rm -f "$ANN_ZIP"
+  # instances_val2017.json should now exist under $COCO_ROOT/annotations
+else
+  echo "[cpu] COCO annotations already present: $COCO_ANN_PATH"
+fi
+
+# -------------------------
+# 5) Download model snapshot (HF official)
+# -------------------------
+if [[ -d "$MODEL_DIR" ]] && [[ -n "$(ls -A "$MODEL_DIR" 2>/dev/null || true)" ]]; then
   echo "[cpu] model already present: $MODEL_DIR"
 else
-  echo "[cpu] model missing; attempting HF download (requires internet + permissions)..."
-  "$PYTHON_BIN" -m pip install --user --index-url "$PIP_PYPI" "huggingface-hub==1.5.0" >/dev/null
-  # NOTE: replace repo id if your local folder maps to a different HF repo
-  huggingface-cli download "Qwen/Qwen3-VL-8B-Instruct" \
-    --local-dir "$MODEL_DIR" --local-dir-use-symlinks False || {
-      echo "[cpu] HF download failed. If you already have the model elsewhere, copy it into:"
-      echo "      $MODEL_DIR"
-    }
+  echo "[cpu] downloading model snapshot: Qwen/Qwen3-VL-8B-Instruct -> $MODEL_DIR"
+  CPU_DL_VENV="$BASE_DIR/venv/cpu_dl_env"
+  if [[ ! -d "$CPU_DL_VENV" ]]; then
+    "$PYTHON_BIN" -m venv "$CPU_DL_VENV"
+  fi
+  source "$CPU_DL_VENV/bin/activate"
+  python -m pip install -U --index-url "$PIP_PYPI" "pip>=24.1" >/dev/null
+  python -m pip install -U --index-url "$PIP_PYPI" "huggingface_hub==1.5.0" "tqdm" >/dev/null
+  python - <<PY
+from huggingface_hub import snapshot_download
+snapshot_download(
+  repo_id="Qwen/Qwen3-VL-8B-Instruct",
+  local_dir="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl/data/models/Qwen3-VL-8B-Instruct",
+  local_dir_use_symlinks=False,
+  resume_download=True,
+)
+print("done")
+PY
+  deactivate
 fi
 
 echo "================================================================"
-echo "✓ DONE"
-echo "  code    : $CODE_DIR"
-echo "  wheels  : $WHEELHOUSE"
-echo "  coco    : $COCO_ROOT"
-echo "  model   : $MODEL_DIR"
+echo "[cpu] DONE"
+echo "  - code:      $CODE_DIR/main.py"
+echo "  - wheelhouse:$WHEELHOUSE"
+echo "  - model:     $MODEL_DIR"
+echo "  - coco img:  $COCO_IMG_DIR"
+echo "  - coco ann:  $COCO_ANN_PATH"
+echo "Next: on GPU node run: bash gpu.sh"
 echo "================================================================"
