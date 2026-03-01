@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+
+# 允许用 sh 运行：自动切回 bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,77 +1,97 @@
-# Phase0 环境脚本（v3）
+# Phase0 环境脚本（求稳版 v5）
 
-这套脚本把责任拆开：
+这套脚本的原则：**不碰你的代码、不清理 git 目录，只处理 venv / wheelhouse。**
 
-- `cpu.sh`：只做一件事——把依赖下载成 **Python 3.10 (cp310)** 的 wheels，放到 `offline_wheels/py310/`。
-  - 不创建 venv
-  - 不修改你现有环境
-  - 不动你的代码
+- `cpu.sh`（联网机器跑）
+  - 创建一个很小的 downloader venv（`venv/p0_cpu_downloader`），只用来跑 `pip download`。
+  - 强制从 **官方 PyPI** 下载，并固定目标为 **manylinux2014_x86_64 + Python 3.10 (cp310)**。
+  - 产物是 `offline_wheels/py310/*.whl`（wheelhouse）。
 
-- `gpu.sh`：在 GPU 节点创建/复用 `venv/p0_env`，并从 wheelhouse **离线安装**依赖。
+- `gpu.sh`（GPU/离线机器跑）
+  - 创建/复用运行 venv（默认 `venv/p0_env`，`--system-site-packages`）。
+  - 只从 wheelhouse 离线安装（`--no-index --find-links`）。
+  - 做一次 import 自检（numpy/torch/transformers/datasets/pycocotools）。
 
-- `run.sh`：跑一次完整 Phase0（probe -> worker -> analyze -> summary）。
+- `run.sh`
+  - probe -> worker -> analyze -> summary 跑一遍 Phase0。
 
-## 1) 修复“文件被删”
+> 你可以用 `sh cpu.sh` / `sh gpu.sh` 跑：脚本会自动 `exec bash`，避免 dash/sh 的兼容坑。
 
-你看到的大量 `deleting transformers/...` 是典型的 `rsync --delete` 或者错误的清理逻辑导致的。
+---
 
-如果你代码是 git 托管：
+## 1) 如果你刚刚“文件被删”了（git 托管的情况）
+
+在 phase0 代码目录：
 
 ```bash
 cd /mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/phase0
 
 git status
-# 恢复工作区文件
+# 恢复被改/被删的受控文件
 git restore .
-# 如果有未跟踪文件乱入再清理（会删掉未跟踪文件）
+
+# 如果你确认需要把未跟踪文件也清掉（会删！慎用）
 # git clean -fd
 ```
 
-## 2) 重新下载 wheelhouse（有网的机器）
+> 这套 v5 脚本本身**不会**对你的 repo 做 `git clean` / `rm -rf` 之类的“扫地机器人行为”。
+
+---
+
+## 2) 在有网机器重新下载 wheelhouse
 
 ```bash
 cd phase0
 bash cpu.sh
 ```
 
-默认优先走官方 PyPI；如果外网不通、公司源更快：
+脚本用 `--isolated` 忽略你机器上的 pip 配置（避免被 `http://pip.sankuai.com/simple` 之类的配置劫持）。
 
-```bash
-P0_INDEX_URL=https://pip.sankuai.com/simple \
-P0_EXTRA_INDEX_URL=https://pypi.org/simple \
-bash cpu.sh
-```
+---
 
-## 3) GPU 节点离线安装
+## 3) 在 GPU 节点离线安装
 
 ```bash
 cd phase0
 bash gpu.sh
 ```
 
-## 4) 跑实验
+如果它报 “找不到 python>=3.9”，说明你当前 shell 里的 python 太旧（例如 3.8）。
+解决方式就是**先切到带 python3.10 的环境**再跑（conda/module），或者显式：
 
 ```bash
-bash run.sh
+P0_PYTHON_RUN=/path/to/python3.10 bash gpu.sh
 ```
 
 ---
 
-# 这份代码在验证什么（Phase0 的“科学假说”）
+## 4) 为什么脚本不会“自动把你终端切进 (p0_env)？”
 
-它在做一个“可证伪推断”的最小验证：
+因为 `sh/b​​ash xxx.sh` 是开一个子进程跑脚本；脚本里的 `source venv/bin/activate` 只影响它自己，
+不可能反向修改你外面那个终端的环境变量。
 
-1. **同一张图，同一个问题**，给模型两种视觉输入：
+如果你想让**当前终端**也进入 venv，手动执行：
+
+```bash
+source venv/p0_env/bin/activate
+```
+
+---
+
+## 5) 这份代码在验证什么（Phase0 在做的事）
+
+Phase0 是一个“先把地基钉稳”的验证：它在检查 **VLM 的视觉证据到底有没有进到推理里**。
+
+核心思想是做“证据敏感性”测试：
+
+1. 对同一张图同一个问题，跑两次前向：
    - 原图
-   - 替换/扰动后的图（把关键证据区域拿走，或做某种替换）
+   - 做过替换/扰动的图（把关键证据区域拿走，或用某种替换方式干预）
+2. 在中间表征（视觉 token / 融合层相关表征）上，计算两次前向的差异（代码里你看到的 JS_sum / CED 等汇总指标）。
+3. 直觉上：
+   - 如果答案真依赖视觉证据，拿走证据后表征应该明显变化。
+   - 如果答案主要靠语言先验在“自信胡说”，拿走证据后变化会更小。
 
-2. 在若干层（vision / cross-attn 相关层）抽取表示，计算两次前向的差异（比如 JS/KL/某种距离汇总成 CED）。
+所以 Phase0 的目标不是“刷分”，而是在验证一个可检验假说：
 
-3. 直觉：
-   - 如果模型的答案真是“看图得出”，拿走证据后内部表示应该明显变化。
-   - 如果模型在“胡说”（主要靠语言先验），拿走证据后表示变化会更小。
-
-4. Phase0 的输出最终会做一个非常硬核的检验：
-   - 用这个差异分数当作一个“hallucination detector”，看能不能把 **hallucination vs correct_positive** 分开（AUC）。
-
-所以 Phase0 本质是在验证：**“证据敏感性”能不能成为 VLM 幻觉检测的信号**。
+> **表征差异（证据敏感性）能不能作为 VLM 幻觉/正确的区分信号。**
