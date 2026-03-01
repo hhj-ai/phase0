@@ -1,93 +1,73 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# Phase0 CPU launcher (safe-by-default)
-# - Runs IN-PLACE inside your git repo (no copying / no rsync / no deleting).
-# - Creates a local venv that *reuses* your current site-packages to avoid
-#   reinstalling heavy deps (torch/transformers) unless missing.
-# -----------------------------------------------------------------------------
+# ============================================================
+# P0: CPU env bootstrap (py310)
+# - ALWAYS re-download wheels
+# - then install offline from wheelhouse
+# - venv uses --system-site-packages
+# ============================================================
 
-BASE_DIR="${P0_BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-cd "$BASE_DIR"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="${ROOT_DIR}/venv/p0_env"
+PYBIN="${VENV_DIR}/bin/python"
+PIP="${PYBIN} -m pip"
 
-# Optional: restore tracked files that were deleted by an earlier rsync --delete
-# (won't recover untracked directories).
-if [[ "${P0_RESTORE_GIT:-0}" == "1" ]]; then
-  if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    echo "[P0] Restoring tracked files from git (checkout -- .)"
-    git checkout -- .
-    git submodule update --init --recursive || true
-  else
-    echo "[P0] P0_RESTORE_GIT=1 set but current dir is not a git repo. Skipping."
-  fi
+WHEELHOUSE="${ROOT_DIR}/offline_wheels/py310"
+mkdir -p "${WHEELHOUSE}"
+
+echo "[P0] ROOT_DIR   : ${ROOT_DIR}"
+echo "[P0] VENV_DIR   : ${VENV_DIR}"
+echo "[P0] WHEELHOUSE : ${WHEELHOUSE}"
+
+# 0) Create venv
+if [[ ! -d "${VENV_DIR}" ]]; then
+  echo "[P0] Creating venv (with --system-site-packages) at: ${VENV_DIR}"
+  python3.10 -m venv --system-site-packages "${VENV_DIR}"
 fi
 
-VENV_DIR="${P0_VENV_DIR:-$BASE_DIR/venv/p0_env}"
-PYTHON_BIN="${P0_PYTHON:-python3}"
+# 1) Conservative pip tooling bootstrap (avoid ultra-new pins that mirrors may not have)
+echo "[P0] Bootstrapping pip tooling (conservative)..."
+${PIP} install -q --upgrade "pip<25" "setuptools<82" "wheel<1" || true
+${PIP} --version || true
 
-mkdir -p "$(dirname "$VENV_DIR")" "$BASE_DIR/data" "$BASE_DIR/results" "$BASE_DIR/logs"
+# 2) Constraints (fix known conflict: datasets 3.2.0 requires fsspec<=2024.9.0)
+CONSTRAINTS_TXT="${ROOT_DIR}/constraints.cpu.txt"
+cat > "${CONSTRAINTS_TXT}" << 'EOF'
+fsspec<=2024.9.0
+EOF
+echo "[P0] constraints written: ${CONSTRAINTS_TXT}"
 
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-  echo "[P0] Creating venv (with --system-site-packages) at: $VENV_DIR"
-  "$PYTHON_BIN" -m venv --system-site-packages "$VENV_DIR"
-fi
+# 3) Requirements (edit as needed)
+REQ_TXT="${ROOT_DIR}/requirements.cpu.txt"
+cat > "${REQ_TXT}" << 'EOF'
+numpy
+pandas
+scikit-learn
+Pillow
+tqdm
+pycocotools
+qwen-vl-utils
+transformers
+accelerate
+datasets
+EOF
+echo "[P0] requirements written: ${REQ_TXT}"
 
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
+# 4) ALWAYS re-download wheels
+echo "[P0] Cleaning wheelhouse..."
+rm -rf "${WHEELHOUSE:?}/"* || true
 
-# Lightweight dependency check: install only if missing.
-python - <<'PY'
-import importlib, sys
-need = [
-  'numpy','pandas','PIL','tqdm','pycocotools','matplotlib'
-]
-missing=[]
-for m in need:
-  try:
-    importlib.import_module(m)
-  except Exception:
-    missing.append(m)
-if missing:
-  print('MISSING:' + ' '.join(missing))
-  sys.exit(2)
-print('OK')
-PY
+echo "[P0] Downloading wheels into wheelhouse (network required)..."
+${PIP} download -d "${WHEELHOUSE}" -c "${CONSTRAINTS_TXT}" -r "${REQ_TXT}"
 
-status=$?
-if [[ $status -eq 2 ]]; then
-  echo "[P0] Installing missing lightweight deps into venv..."
-  # If you have an offline wheelhouse, set P0_WHEELHOUSE to it.
-  WHEELHOUSE="${P0_WHEELHOUSE:-$BASE_DIR/data/wheels}"
-  if [[ -d "$WHEELHOUSE" ]] && compgen -G "$WHEELHOUSE/*.whl" > /dev/null; then
-    python -m pip install --no-index --find-links "$WHEELHOUSE" -r requirements.notorch.txt
-  else
-    python -m pip install -r requirements.notorch.txt
-  fi
-fi
+# 5) Offline install from wheelhouse
+echo "[P0] Installing OFFLINE from wheelhouse..."
+${PIP} install --no-index --find-links "${WHEELHOUSE}" -c "${CONSTRAINTS_TXT}" -r "${REQ_TXT}"
 
-# Run a single-process worker on CPU (small N by default)
-MODEL_PATH="${P0_MODEL_PATH:-$BASE_DIR/models/Qwen3-VL-8B-Instruct}"
-COCO_ROOT="${P0_COCO_ROOT:-$BASE_DIR/data/coco}"
-N_SAMPLES="${P0_N_SAMPLES:-100}"
-
-python main.py probe \
-  --base_dir "$BASE_DIR" \
-  --model_path "$MODEL_PATH" \
-  --coco_root "$COCO_ROOT" \
-  --n_samples 8
-
-python main.py worker \
-  --base_dir "$BASE_DIR" \
-  --model_path "$MODEL_PATH" \
-  --coco_root "$COCO_ROOT" \
-  --device cpu \
-  --n_samples "$N_SAMPLES" \
-  --num_shards 1 \
-  --shard_idx 0 \
-  --layers ${P0_LAYERS:-16 20 24 28 32}
-
-python main.py analyze --base_dir "$BASE_DIR"
-python main.py summary --base_dir "$BASE_DIR"
-
-echo "[P0] Done. Results: $BASE_DIR/results  Logs: $BASE_DIR/logs"
+# 6) Sanity checks
+echo "[P0] Sanity check imports..."
+${PYBIN} -c "import sys; print('python', sys.version)"
+${PYBIN} -c "import pycocotools; print('pycocotools OK')"
+${PYBIN} -c "import datasets, fsspec; print('datasets', datasets.__version__, 'fsspec', fsspec.__version__)"
+echo "[P0] DONE."
