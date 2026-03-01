@@ -1,16 +1,16 @@
-# Phase0 minimal deps (torch/cuda is provided by system-site-packages; do NOT pip install torch here)
-# Target: Python 3.10 (Transformers 5.2.0 requires >=3.10)
-
-numpy==1.26.4
-pillow==10.4.0
-opencv-python-headless==4.10.0.84
-tqdm==4.66.5
-
-# Qwen3-VL support lives in modern Transformers
-transformers==5.2.0
-accelerate==1.12.0
-
-# sdist-only on PyPI (cpu.sh will download sdist and build a wheel into wheelhouse)
-qwen-vl-utils==0.0.14
-
+# GPU runtime requirements (installed offline on worker)
+# 你可按集群 CUDA 情况选择 cu121/cu124 等；这里示例 cu124
+torch==2.4.1+cu124
+torchvision==0.19.1+cu124
+--extra-index-url https://download.pytorch.org/whl/cu124
+numpy
+pillow
+requests
+tqdm
+datasets==3.2.0
+fsspec[http]<=2024.9.0
 pycocotools==2.0.7
+scikit-learn==1.5.2
+qwen-vl-utils==0.0.14
+transformers
+accelerate

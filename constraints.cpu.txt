@@ -1,3 +1,4 @@
-# Extra constraints to keep --system-site-packages sane.
-# Some clusters preinstall datasets==3.x which (historically) required fsspec < 2024.10.0.
-fsspec==2024.9.0
+# CPU-side constraints (keep it conservative)
+pip<25
+setuptools<83
+wheel
