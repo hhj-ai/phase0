@@ -1,6 +1,6 @@
 -r requirements.cpu.txt
 
-# torch (you said you want cu124 + torch 2.4.1)
+# torch (cu124)
 torch==2.4.1+cu124
 torchvision==0.19.1+cu124
 torchaudio==2.4.1+cu124
