@@ -693,15 +693,26 @@ def run_worker(args: argparse.Namespace, paths: Paths) -> None:
 
     # IMPORTANT: under torchrun, each process must bind to its own GPU.
     # Prefer LOCAL_RANK if present; fall back to --device only in non-torchrun runs.
-    local_rank_env = os.environ.get("LOCAL_RANK")
-    if local_rank_env is not None:
-        device_id = int(local_rank_env)
-    else:
-        device_id = int(args.device) if args.device is not None else 0
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device_id)
-    device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
-    print(f"[worker] shard={shard_idx}/{num_shards} local_rank={local_rank_env} device={device}")
+# Detect per-process local rank (torchrun / slurm / mpi). If missing, fall back to global rank modulo #GPUs.
+local_rank_env = (
+    os.environ.get("LOCAL_RANK")
+    or os.environ.get("SLURM_LOCALID")
+    or os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
+    or os.environ.get("MPI_LOCALRANKID")
+)
+global_rank_env = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or os.environ.get("OMPI_COMM_WORLD_RANK")
+
+if local_rank_env is not None:
+    device_id = int(local_rank_env)
+elif global_rank_env is not None and torch.cuda.is_available():
+    device_id = int(global_rank_env) % torch.cuda.device_count()
+else:
+    device_id = int(args.device) if args.device is not None else 0
+
+if torch.cuda.is_available():
+    torch.cuda.set_device(device_id)
+device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+print(f"[worker] shard={shard_idx}/{num_shards} local_rank={local_rank_env} rank={global_rank_env} device={device} visible={os.environ.get('CUDA_VISIBLE_DEVICES','')}")
 
     ensure_dir(paths.result_dir)
     model, processor = load_model_and_processor(paths.model_path, device)
@@ -734,69 +745,133 @@ def run_worker(args: argparse.Namespace, paths: Paths) -> None:
     pd.DataFrame(rows).to_csv(out_csv, index=False)
     print(f"[saved] {out_csv} rows={len(rows)}")
 
-def run_analyze(_args: argparse.Namespace, paths: Paths) -> None:
-    ensure_dir(paths.result_dir)
-    shard_files = sorted(glob.glob(os.path.join(paths.result_dir, "p0b_shard_*_of_*.csv")))
-    if not shard_files:
-        raise RuntimeError(f"No shard files found in {paths.result_dir}")
+def run_analyze(args: argparse.Namespace, paths: Paths) -> None:
+    import pandas as pd
+    import numpy as np
 
-    dfs = [pd.read_csv(f) for f in shard_files]
-    merged = pd.concat(dfs, ignore_index=True)
-    merged_path = os.path.join(paths.result_dir, "p0b_merged.csv")
-    merged.to_csv(merged_path, index=False)
+    # Collect shards
+    shard_paths = sorted(glob.glob(os.path.join(paths.result_dir, "p0b_shard_*_of_*.csv")))
+    if not shard_paths:
+        print(f"[analyze] no shard csv found under: {paths.result_dir}")
+        return
 
-    sub = merged[merged["behavior"].isin(["correct_positive", "hallucination"])].copy()
-    y = (sub["behavior"] == "correct_positive").astype(int).to_numpy()
-    auc = rank_auc(y, sub["ced"].to_numpy(dtype=float))
-
-    stats = (merged.groupby("behavior")["ced"]
-             .agg(["count", "mean", "std", "min", "max"])
-             .reset_index())
-
-    summary = {
-        "merged_csv": merged_path,
-        "rows": int(len(merged)),
-        "columns": int(merged.shape[1]),
-        "score_col": "ced",
-        "behavior_stats": stats.to_dict(orient="records"),
-        "cp_n": int((merged["behavior"] == "correct_positive").sum()),
-        "hal_n": int((merged["behavior"] == "hallucination").sum()),
-        "auc": float(auc),
-    }
-    summary_path = os.path.join(paths.result_dir, "p0b_summary.json")
-    save_json(summary, summary_path)
-
-    if _HAS_MPL:
+    dfs = []
+    for p in shard_paths:
         try:
-            plt.figure()
-            cp = sub[sub["behavior"] == "correct_positive"]["ced"].astype(float).to_numpy()
-            hal = sub[sub["behavior"] == "hallucination"]["ced"].astype(float).to_numpy()
+            dfs.append(pd.read_csv(p))
+        except Exception as e:
+            print(f"[analyze] failed to read {p}: {e}")
+
+    if not dfs:
+        print("[analyze] no readable shard csv.")
+        return
+
+    df = pd.concat(dfs, ignore_index=True)
+    merged_csv = os.path.join(paths.result_dir, "p0b_merged.csv")
+    df.to_csv(merged_csv, index=False)
+
+    print("=" * 60)
+    print("P0 Results Summary")
+    print("=" * 60)
+    print(f"merged_csv : {merged_csv}")
+    print(f"rows       : {len(df)}")
+    print(f"columns    : {len(df.columns)}")
+
+    # Behavior stats
+    if "behavior" in df.columns and "ced" in df.columns:
+        stats = df.groupby("behavior")["ced"].agg(["count", "mean", "std", "min", "max"]).reset_index()
+        print("\n--- Behavior Distribution ---")
+        print(stats.set_index("behavior").to_string())
+    else:
+        stats = None
+        print("\n[warn] missing columns to compute behavior distribution (need: behavior, ced)")
+
+    # Ensure delta/ratio exist
+    if "ctrl_ced" in df.columns and "ced" in df.columns:
+        if "delta_ced" not in df.columns:
+            df["delta_ced"] = df["ced"].astype(float) - df["ctrl_ced"].astype(float)
+        if "ratio_ced" not in df.columns:
+            df["ratio_ced"] = df["ced"].astype(float) / (df["ctrl_ced"].astype(float) + 1e-6)
+
+    # Core AUCs: correct_positive vs hallucination
+    sub = df[df["behavior"].isin(["correct_positive", "hallucination"])].copy() if "behavior" in df.columns else df.copy()
+    cp_n = int((sub["behavior"] == "correct_positive").sum()) if "behavior" in sub.columns else 0
+    hal_n = int((sub["behavior"] == "hallucination").sum()) if "behavior" in sub.columns else 0
+
+    aucs: Dict[str, float] = {}
+    if "behavior" in sub.columns:
+        y = (sub["behavior"] == "correct_positive").astype(int).to_numpy()
+        for col in ["ced", "delta_ced", "ratio_ced", "ctrl_ced", "js_sum", "kl_sum", "ctrl_js_sum", "ctrl_kl_sum"]:
+            if col in sub.columns:
+                ss = sub.dropna(subset=[col]).copy()
+                if len(ss) < 10:
+                    continue
+                yy = (ss["behavior"] == "correct_positive").astype(int).to_numpy()
+                vv = ss[col].to_numpy(dtype=float)
+                a = rank_auc(yy, vv)
+                if not np.isnan(a):
+                    aucs[col] = float(a)
+
+    # Choose score_mode for plotting / headline
+    score_mode = getattr(args, "score_mode", "ratio")
+    score_col = {"ced": "ced", "delta": "delta_ced", "ratio": "ratio_ced"}.get(score_mode, "ratio_ced")
+    if score_col not in sub.columns:
+        score_col = "ced" if "ced" in sub.columns else (list(aucs.keys())[0] if aucs else "")
+
+    if "behavior" in sub.columns and score_col:
+        ss = sub.dropna(subset=[score_col]).copy()
+        yy = (ss["behavior"] == "correct_positive").astype(int).to_numpy()
+        vv = ss[score_col].to_numpy(dtype=float)
+        auc_head = rank_auc(yy, vv)
+        print("\n--- Core AUC: correct_positive vs hallucination ---")
+        print(f"  cp={cp_n} hal={hal_n} total={len(sub)}")
+        print(f"  AUC({score_col}) = {auc_head:.4f}")
+    else:
+        auc_head = float("nan")
+
+    # Plot histogram for chosen score
+    fig_path = os.path.join(paths.result_dir, f"p0b_hist_cp_vs_hal_{score_col}.png" if score_col else "p0b_hist_cp_vs_hal.png")
+    if "behavior" in sub.columns and score_col:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt  # noqa
+            cp = sub[sub["behavior"] == "correct_positive"][score_col].dropna().astype(float).to_numpy()
+            hal = sub[sub["behavior"] == "hallucination"][score_col].dropna().astype(float).to_numpy()
+            plt.figure(figsize=(8, 4))
             plt.hist(cp, bins=40, alpha=0.6, label="correct_positive")
             plt.hist(hal, bins=40, alpha=0.6, label="hallucination")
-            plt.xlabel("CED")
+            plt.xlabel(score_col)
             plt.ylabel("count")
+            title_auc = aucs.get(score_col, auc_head)
+            plt.title(f"CP vs HAL ({score_col}) AUC={title_auc:.4f}" if not np.isnan(title_auc) else f"CP vs HAL ({score_col})")
             plt.legend()
-            fig_path = os.path.join(paths.result_dir, "p0b_hist_cp_vs_hal.png")
             plt.tight_layout()
             plt.savefig(fig_path, dpi=200)
             plt.close()
             print(f"[saved] {fig_path}")
         except Exception as e:
-            print(f"[warn] histogram failed: {e}")
+            print(f"[warn] matplotlib plot failed: {e}")
 
-    print("============================================================")
-    print("P0 Results Summary")
-    print("============================================================")
-    print(f"merged_csv : {merged_path}")
-    print(f"rows       : {len(merged)}")
-    print(f"columns    : {merged.shape[1]}")
-    print("\n--- Behavior Distribution ---")
-    print(merged.groupby("behavior")["ced"].agg(["count", "mean", "std", "min", "max"]))
-    print("\n--- Core AUC: correct_positive vs hallucination ---")
-    print(f"  cp={int((sub['behavior']=='correct_positive').sum())} hal={int((sub['behavior']=='hallucination').sum())} total={len(sub)}")
-    print(f"  AUC(ced) = {auc:.4f}")
-    print(f"\n[saved] {summary_path}")
+    # Write summary JSON
+    summary = {
+        "merged_csv": merged_csv,
+        "rows": int(len(df)),
+        "score_mode": score_mode,
+        "score_col": score_col,
+        "cp_n": cp_n,
+        "hal_n": hal_n,
+        "auc_headline": None if np.isnan(auc_head) else float(auc_head),
+        "aucs": aucs,
+        "behavior_stats": [],
+    }
+    if stats is not None:
+        summary["behavior_stats"] = stats.to_dict(orient="records")
 
+    out_json = os.path.join(paths.result_dir, "p0b_summary.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"[saved] {out_json}")
 def run_summary(_args: argparse.Namespace, paths: Paths) -> None:
     merged_path = os.path.join(paths.result_dir, "p0b_merged.csv")
     if not os.path.exists(merged_path):
@@ -884,8 +959,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--num_shards", type=int, default=None)
     p_worker.add_argument("--num_samples", type=int, default=400)
 
-    sp.add_parser("analyze", help="merge shards + summary")
-    sp.add_parser("summary", help="AUC ranking + ctrl NaN check + delta/ratio")
+    p_analyze = sp.add_parser("analyze", help="merge shards + summary")
+
+    p_analyze.add_argument("--score_mode", type=str, default="ratio", choices=["ced","delta","ratio"],
+                          help="which score to treat as headline (ced / delta / ratio)")
+
+    p_summary = sp.add_parser("summary", help="AUC ranking + ctrl NaN check + delta/ratio")
+
+    p_summary.add_argument("--score_mode", type=str, default="ratio", choices=["ced","delta","ratio"],
+                          help="which score to treat as headline when printing (ced / delta / ratio)")
+
 
     return p
 

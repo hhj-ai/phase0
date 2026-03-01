@@ -1,261 +1,171 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# cpu.sh  (CPU服务器 / 有网)
-# - 准备离线依赖(wheelhouse)、模型、COCO val2017
-# - 强制使用官方源：PyTorch cu124 index + PyPI
-# - 目标：GPU 侧 Python 3.10 (cp310), manylinux2014_x86_64
-#
-# 修复点：
-# 1) torch 版本号不要写成 2.4.1+cu124（pip download 解析经常失败）
-#    正确做法：torch==2.4.1 + 把 index-url 指向 cu124
-# 2) 先下载 torch/vision/audio（主 index=cu124，extra=PyPI），再下载其余依赖（主 index=PyPI）
-# ============================================================
+# =========================
+# P0 CPU bootstrap (official sources)
+# - sync code to SHARED/code
+# - download COCO val2017
+# - download model (optional, if missing)
+# - download wheels into SHARED/data/wheels for offline GPU install
+# =========================
 
-# ----------------------------
-# 硬编码共享目录（按你给的）
-# ----------------------------
+# -------- Hardcoded project root --------
 SHARED="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl"
+
+CODE_DIR="$SHARED/code"
 DATA_DIR="$SHARED/data"
 WHEELHOUSE="$DATA_DIR/wheels"
 MODEL_DIR="$DATA_DIR/models/Qwen3-VL-8B-Instruct"
+
 COCO_ROOT="$DATA_DIR/datasets/coco_val2017"
-CODE_DIR="$SHARED/code"
-
-# 是否清理旧结果(只删 results/logs 里 p0a/p0b 的产物，不动数据/模型)
-CLEAN_OLD_RESULTS="${CLEAN_OLD_RESULTS:-1}"
-
-# ----------------------------
-# 强制官方 pip 源（忽略系统 pip.conf / 环境变量）
-# ----------------------------
-export PIP_CONFIG_FILE=/dev/null
-unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS PIP_NO_INDEX || true
-
-PYPI_URL="https://pypi.org/simple"
-TORCH_CU124_URL="https://download.pytorch.org/whl/cu124"
-
-# 目标平台（给 GPU 用的 wheels）
-TARGET_PLATFORM="manylinux2014_x86_64"
-TARGET_PY="310"
-TARGET_ABI="cp310"
-TARGET_IMPL="cp"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-mkdir -p "$WHEELHOUSE" "$MODEL_DIR" "$COCO_ROOT" "$CODE_DIR" "$SHARED/results" "$SHARED/logs"
+COCO_IMG_DIR="$COCO_ROOT/val2017"
+COCO_ANN_DIR="$COCO_ROOT/annotations"
+COCO_ANN_PATH="$COCO_ANN_DIR/instances_val2017.json"
 
 echo "================================================================"
 echo "[cpu] SHARED      : $SHARED"
+echo "[cpu] CODE_DIR    : $CODE_DIR"
 echo "[cpu] WHEELHOUSE  : $WHEELHOUSE"
 echo "[cpu] MODEL_DIR   : $MODEL_DIR"
 echo "[cpu] COCO_ROOT   : $COCO_ROOT"
 echo "================================================================"
 
-if [ "$CLEAN_OLD_RESULTS" = "1" ]; then
-  echo "[cpu] cleaning old results/logs (p0a/p0b only)..."
-  rm -f "$SHARED/results"/p0a_probe_info.json || true
-  rm -f "$SHARED/results"/p0b_* || true
-  rm -f "$SHARED/logs"/p0* || true
-fi
+mkdir -p "$CODE_DIR" "$WHEELHOUSE" "$MODEL_DIR" "$COCO_ROOT" "$COCO_ANN_DIR"
 
-# ----------------------------
-# 0) 同步代码到共享目录（方便 GPU 直接跑）
-# ----------------------------
+# -------- Sync code (expects main.py/cpu.sh/gpu.sh in the same folder as this script) --------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "[cpu] syncing code -> $CODE_DIR"
-MAIN_SRC="$SCRIPT_DIR/main.py"
-GPU_SRC="$SCRIPT_DIR/gpu.sh"
-CPU_SRC="$SCRIPT_DIR/cpu.sh"
-# allow alternative filenames when you download as *_v4
-if [ ! -f "$MAIN_SRC" ] && [ -f "$SCRIPT_DIR/main_v4.py" ]; then MAIN_SRC="$SCRIPT_DIR/main_v4.py"; fi
-if [ ! -f "$GPU_SRC" ] && [ -f "$SCRIPT_DIR/gpu_v4.sh" ]; then GPU_SRC="$SCRIPT_DIR/gpu_v4.sh"; fi
-if [ ! -f "$CPU_SRC" ] && [ -f "$SCRIPT_DIR/cpu_v4.sh" ]; then CPU_SRC="$SCRIPT_DIR/cpu_v4.sh"; fi
-cp -f "$MAIN_SRC" "$CODE_DIR/main.py"
-cp -f "$GPU_SRC"  "$CODE_DIR/gpu.sh"
-cp -f "$CPU_SRC"  "$CODE_DIR/cpu.sh" 2>/dev/null || true
+cp -f "$SCRIPT_DIR/main.py" "$CODE_DIR/main.py"
+cp -f "$SCRIPT_DIR/cpu.sh"  "$CODE_DIR/cpu.sh"  || true
+cp -f "$SCRIPT_DIR/gpu.sh"  "$CODE_DIR/gpu.sh"  || true
+chmod +x "$CODE_DIR/"*.sh || true
 
-# ----------------------------
-# 1) 写 requirements（锁住关键项）
-#    注意：torch 不写 +cu124；靠 index-url 选 CUDA 轮子
-# ----------------------------
-REQ="$CODE_DIR/requirements.lock.txt"
-cat > "$REQ" <<'EOF'
-# --- torch stack (CUDA via index-url cu124) ---
-torch==2.4.1
-torchvision==0.19.1
-torchaudio==2.4.1
+# -------- Write requirements (pin versions that exist on PyPI) --------
+REQ_NO_TORCH="$CODE_DIR/requirements.notorch.txt"
+REQ_LOCK="$CODE_DIR/requirements.lock.txt"
 
-# --- hf / vl ---
+cat > "$REQ_NO_TORCH" <<'REQ'
+# Core runtime (pin to known-good versions)
 transformers==5.2.0
 tokenizers==0.22.2
 huggingface-hub==1.5.0
-qwen-vl-utils==0.0.14
+safetensors>=0.4.3
+accelerate>=0.30.0
+# vision/io
+pillow>=10.3.0
+opencv-python-headless>=4.9.0.80
+# data
+numpy>=1.26.4
+pandas>=2.2.2
+tqdm>=4.66.4
+pyyaml>=6.0.1
+requests>=2.32.3
+# plotting (optional, but nice for p0b_hist)
+matplotlib>=3.8.4
+# Qwen VL helper (if your code uses it)
+qwen-vl-utils>=0.0.8
+REQ
 
-# --- common runtime ---
-numpy
-pillow
-pandas
-matplotlib
-scipy
-scikit-learn
-pycocotools
-tqdm
-protobuf
-sentencepiece
-safetensors
-einops
-accelerate
-EOF
-echo "[cpu] requirements written: $REQ"
+cat > "$REQ_LOCK" <<'REQ'
+# Torch stack (use PyTorch CUDA12.4 index to get the right wheels)
+torch==2.4.1
+# optional: torchvision/torchaudio if needed
+# torchvision==0.19.1
+# torchaudio==2.4.1
+REQ
 
-# 生成一个不含 torch 三件套的 requirements（给 PyPI 下载用）
-REQ_NO_TORCH="$CODE_DIR/requirements.notorch.txt"
-grep -v -E '^(torch|torchvision|torchaudio)==' "$REQ" > "$REQ_NO_TORCH"
-echo "[cpu] requirements (no torch) written: $REQ_NO_TORCH"
+# append the no-torch stack
+cat "$REQ_NO_TORCH" >> "$REQ_LOCK"
 
-# ----------------------------
-# 2) 清理 wheelhouse 里明显不匹配的 torch（比如 cp38/cp39/cp311）
-# ----------------------------
+echo "[cpu] requirements written:"
+echo "  - $REQ_NO_TORCH"
+echo "  - $REQ_LOCK"
+
+# -------- Clean mismatched wheels (keep cp310) --------
 echo "[cpu] cleaning mismatched torch wheels (keep cp310)..."
-rm -f "$WHEELHOUSE"/torch-*-cp3[789]*.whl \
-      "$WHEELHOUSE"/torchvision-*-cp3[789]*.whl \
-      "$WHEELHOUSE"/torchaudio-*-cp3[789]*.whl 2>/dev/null || true
+find "$WHEELHOUSE" -maxdepth 1 -type f \( -name "*cp38*.whl" -o -name "*cp39*.whl" -o -name "*cp311*.whl" -o -name "*cp312*.whl" \) -print -delete || true
 
-# 也顺手清掉 cp311/cp312（避免 GPU 误装）
-rm -f "$WHEELHOUSE"/torch-*-cp31[12]*.whl \
-      "$WHEELHOUSE"/torchvision-*-cp31[12]*.whl \
-      "$WHEELHOUSE"/torchaudio-*-cp31[12]*.whl 2>/dev/null || true
+# -------- Ensure pip tooling is present --------
+PYTHON_BIN="${PYTHON_BIN:-python3.10}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+fi
 
-# ----------------------------
-# 3) 下载 pip/setuptools/wheel 自身（GPU 离线 venv 更稳）
-# ----------------------------
-echo "[cpu] downloading bootstrap wheels (pip/setuptools/wheel)..."
-python3 -m pip download -d "$WHEELHOUSE" \
-  -i "$PYPI_URL" \
-  --no-cache-dir --disable-pip-version-check \
-  "pip" "setuptools" "wheel" >/dev/null
+# Always force official sources (ignore any global pip.conf mirror)
+PIP_PYPI="https://pypi.org/simple"
+PIP_TORCH_CU124="https://download.pytorch.org/whl/cu124"
 
-# ----------------------------
-# 4) 先下载 torch/vision/audio（主 index=cu124，extra=PyPI）
-# ----------------------------
-echo "[cpu] downloading torch stack from cu124 (target cp310)..."
-python3 -m pip download -d "$WHEELHOUSE" \
+echo "[cpu] downloading bootstrap wheels (pip/setuptools/wheel) from PyPI..."
+"$PYTHON_BIN" -m pip download -d "$WHEELHOUSE" \
+  --only-binary=:all: --no-deps \
+  --index-url "$PIP_PYPI" \
+  "pip==26.0.1" "setuptools==82.0.0" "wheel==0.45.1"
+
+echo "[cpu] downloading torch wheels (CUDA 12.4) into wheelhouse..."
+"$PYTHON_BIN" -m pip download -d "$WHEELHOUSE" \
   --only-binary=:all: \
-  --platform "$TARGET_PLATFORM" \
-  --python-version "$TARGET_PY" \
-  --abi "$TARGET_ABI" \
-  --implementation "$TARGET_IMPL" \
-  -i "$TORCH_CU124_URL" \
-  --extra-index-url "$PYPI_URL" \
-  --no-cache-dir --disable-pip-version-check \
-  "torch==2.4.1" "torchvision==0.19.1" "torchaudio==2.4.1"
+  --platform manylinux2014_x86_64 --python-version 310 --implementation cp --abi cp310 \
+  --index-url "$PIP_TORCH_CU124" --extra-index-url "$PIP_PYPI" \
+  -r "$REQ_LOCK"
 
-# ----------------------------
-# 5) 下载其余依赖（主 index=PyPI）
-# ----------------------------
-echo "[cpu] downloading other deps from PyPI (target cp310)..."
-python3 -m pip download -r "$REQ_NO_TORCH" -d "$WHEELHOUSE" \
+echo "[cpu] downloading remaining wheels (no-torch) into wheelhouse..."
+"$PYTHON_BIN" -m pip download -d "$WHEELHOUSE" \
   --only-binary=:all: \
-  --platform "$TARGET_PLATFORM" \
-  --python-version "$TARGET_PY" \
-  --abi "$TARGET_ABI" \
-  --implementation "$TARGET_IMPL" \
-  -i "$PYPI_URL" \
-  --no-cache-dir --disable-pip-version-check
+  --platform manylinux2014_x86_64 --python-version 310 --implementation cp --abi cp310 \
+  --index-url "$PIP_PYPI" \
+  -r "$REQ_NO_TORCH"
 
-echo "[cpu] wheelhouse count: $(ls -1 "$WHEELHOUSE" | wc -l)"
-echo "[cpu] torch wheels sanity (should be cp310 + cu124):"
-ls -1 "$WHEELHOUSE" | grep -E '^(torch|torchvision|torchaudio)-' | head -n 20 || true
+echo "[cpu] wheelhouse size: $(ls -1 "$WHEELHOUSE" | wc -l) files"
 
-# ----------------------------
-# 6) 下载 COCO val2017 + annotations（官方 COCO 源）
-# ----------------------------
-download_if_needed () {
+# -------- Download COCO val2017 (official COCO host) --------
+download_and_unzip () {
   local url="$1"
-  local out="$2"
-  local name
-  name="$(basename "$out")"
-  if [ -f "$out" ]; then
-    if [[ "$out" == *.zip ]]; then
-      unzip -t "$out" >/dev/null 2>&1 && { echo "[cpu] coco ok: $name"; return 0; }
-      echo "[cpu] coco zip corrupt -> re-download: $name"
-      rm -f "$out"
-    else
-      echo "[cpu] coco ok: $name"
-      return 0
-    fi
+  local zip_path="$2"
+  local dst_dir="$3"
+
+  if [ -d "$dst_dir" ] && [ "$(find "$dst_dir" -maxdepth 1 -type f | wc -l)" -gt 10 ]; then
+    echo "[cpu] already present: $dst_dir"
+    return
   fi
-  echo "[cpu] downloading: $name"
-  if command -v curl >/dev/null 2>&1; then
-    curl -L --retry 10 --retry-delay 2 -o "$out" "$url"
-  else
-    wget -c -t 10 -O "$out" "$url"
-  fi
-  if [[ "$out" == *.zip ]]; then
-    unzip -t "$out" >/dev/null 2>&1 || { echo "[cpu] ERROR: zip invalid: $out"; exit 1; }
-  fi
+
+  mkdir -p "$(dirname "$zip_path")"
+  echo "[cpu] downloading: $url"
+  curl -L --retry 5 --retry-delay 2 -o "$zip_path" "$url"
+
+  echo "[cpu] testing zip: $zip_path"
+  unzip -t "$zip_path" >/dev/null
+
+  echo "[cpu] extracting -> $dst_dir"
+  unzip -q "$zip_path" -d "$COCO_ROOT"
 }
 
-VAL_ZIP="$COCO_ROOT/val2017.zip"
-ANN_ZIP="$COCO_ROOT/annotations_trainval2017.zip"
-VAL_DIR="$COCO_ROOT/val2017"
-ANN_DIR="$COCO_ROOT/annotations"
+download_and_unzip "https://images.cocodataset.org/zips/val2017.zip" "$COCO_ROOT/val2017.zip" "$COCO_IMG_DIR"
 
-COCO_URL_BASE="https://images.cocodataset.org/zips"
-COCO_ANN_BASE="https://images.cocodataset.org/annotations"
-
-download_if_needed "${COCO_URL_BASE}/val2017.zip" "$VAL_ZIP"
-download_if_needed "${COCO_ANN_BASE}/annotations_trainval2017.zip" "$ANN_ZIP"
-
-if [ ! -d "$VAL_DIR" ]; then
-  echo "[cpu] extracting val2017..."
-  unzip -q "$VAL_ZIP" -d "$COCO_ROOT"
-fi
-if [ ! -d "$ANN_DIR" ]; then
-  echo "[cpu] extracting annotations..."
-  unzip -q "$ANN_ZIP" -d "$COCO_ROOT"
+if [ ! -f "$COCO_ANN_PATH" ]; then
+  echo "[cpu] downloading COCO annotations..."
+  curl -L --retry 5 --retry-delay 2 -o "$COCO_ROOT/annotations_trainval2017.zip" \
+    "https://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+  unzip -q "$COCO_ROOT/annotations_trainval2017.zip" -d "$COCO_ROOT"
 fi
 
-# ----------------------------
-# 7) 模型：如果不存在再下载（HF 官方）
-# ----------------------------
-if [ -f "$MODEL_DIR/config.json" ] || [ -f "$MODEL_DIR/model.safetensors.index.json" ] || ls "$MODEL_DIR"/*.safetensors >/dev/null 2>&1; then
+# -------- Optional: download model from HF if missing --------
+if [ -f "$MODEL_DIR/config.json" ]; then
   echo "[cpu] model already present: $MODEL_DIR"
 else
-  echo "[cpu] model not found -> downloading from Hugging Face (official)..."
-
-  DL_VENV="$SHARED/venv/cpu_dl_env"
-  if [ ! -d "$DL_VENV" ]; then
-    python3 -m venv "$DL_VENV"
-  fi
-  source "$DL_VENV/bin/activate"
-  python -m pip install -U pip -i "$PYPI_URL" --no-cache-dir --disable-pip-version-check >/dev/null
-  python -m pip install -U "huggingface_hub>=0.24" "hf_transfer" -i "$PYPI_URL" --no-cache-dir --disable-pip-version-check >/dev/null || true
-  export HF_HUB_ENABLE_HF_TRANSFER=1
-
-  # 如果需要 token：export HF_TOKEN=...
-  MODEL_DIR="$MODEL_DIR" python - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-repo_id = "Qwen/Qwen3-VL-8B-Instruct"
-local_dir = os.environ["MODEL_DIR"]
-token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-snapshot_download(
-    repo_id=repo_id,
-    local_dir=local_dir,
-    local_dir_use_symlinks=False,
-    token=token,
-)
-print("[cpu] downloaded:", repo_id, "->", local_dir)
-PY
-  deactivate || true
+  echo "[cpu] model missing; attempting HF download (requires internet + permissions)..."
+  "$PYTHON_BIN" -m pip install --user --index-url "$PIP_PYPI" "huggingface-hub==1.5.0" >/dev/null
+  # NOTE: replace repo id if your local folder maps to a different HF repo
+  huggingface-cli download "Qwen/Qwen3-VL-8B-Instruct" \
+    --local-dir "$MODEL_DIR" --local-dir-use-symlinks False || {
+      echo "[cpu] HF download failed. If you already have the model elsewhere, copy it into:"
+      echo "      $MODEL_DIR"
+    }
 fi
 
 echo "================================================================"
-echo "[cpu] DONE"
-echo "  wheelhouse : $WHEELHOUSE"
-echo "  coco imgs  : $VAL_DIR"
-echo "  coco ann   : $ANN_DIR/instances_val2017.json"
-echo "  model      : $MODEL_DIR"
-echo "  code       : $CODE_DIR/main.py  $CODE_DIR/gpu.sh"
+echo "✓ DONE"
+echo "  code    : $CODE_DIR"
+echo "  wheels  : $WHEELHOUSE"
+echo "  coco    : $COCO_ROOT"
+echo "  model   : $MODEL_DIR"
 echo "================================================================"
