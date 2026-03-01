@@ -3,17 +3,22 @@ set -euo pipefail
 
 # ============================================================
 # cpu.sh  (CPU服务器 / 有网)
-# - 只负责：准备离线依赖(wheelhouse)、模型、COCO val2017
-# - 强制使用官方源：PyPI + PyTorch 官方 cu124
-# - 目标运行环境：GPU 侧 Python 3.10 (cp310), Linux x86_64 manylinux2014
+# - 准备离线依赖(wheelhouse)、模型、COCO val2017
+# - 强制使用官方源：PyTorch cu124 index + PyPI
+# - 目标：GPU 侧 Python 3.10 (cp310), manylinux2014_x86_64
+#
+# 修复点：
+# 1) torch 版本号不要写成 2.4.1+cu124（pip download 解析经常失败）
+#    正确做法：torch==2.4.1 + 把 index-url 指向 cu124
+# 2) 先下载 torch/vision/audio（主 index=cu124，extra=PyPI），再下载其余依赖（主 index=PyPI）
 # ============================================================
 
 # ----------------------------
 # 硬编码共享目录（按你给的）
 # ----------------------------
 SHARED="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl"
-WHEELHOUSE="$SHARED/data/wheels"
 DATA_DIR="$SHARED/data"
+WHEELHOUSE="$DATA_DIR/wheels"
 MODEL_DIR="$DATA_DIR/models/Qwen3-VL-8B-Instruct"
 COCO_ROOT="$DATA_DIR/datasets/coco_val2017"
 CODE_DIR="$SHARED/code"
@@ -64,20 +69,19 @@ cp -f "$SCRIPT_DIR/cpu.sh"  "$CODE_DIR/cpu.sh" 2>/dev/null || true
 
 # ----------------------------
 # 1) 写 requirements（锁住关键项）
-#    说明：transformers 5.x Requires-Python>=3.10。
-#    CPU 机器如果不是 3.10 也没关系，我们只用 pip download 的 cross-platform 模式。
+#    注意：torch 不写 +cu124；靠 index-url 选 CUDA 轮子
 # ----------------------------
 REQ="$CODE_DIR/requirements.lock.txt"
 cat > "$REQ" <<'EOF'
-# --- core ---
-torch==2.4.1+cu124
-torchvision==0.19.1+cu124
-torchaudio==2.4.1+cu124
+# --- torch stack (CUDA via index-url cu124) ---
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
 
+# --- hf / vl ---
 transformers==5.2.0
 tokenizers==0.23.0
 huggingface-hub==1.5.0
-
 qwen-vl-utils==0.0.14
 
 # --- common runtime ---
@@ -97,29 +101,67 @@ accelerate
 EOF
 echo "[cpu] requirements written: $REQ"
 
+# 生成一个不含 torch 三件套的 requirements（给 PyPI 下载用）
+REQ_NO_TORCH="$CODE_DIR/requirements.notorch.txt"
+grep -v -E '^(torch|torchvision|torchaudio)==' "$REQ" > "$REQ_NO_TORCH"
+echo "[cpu] requirements (no torch) written: $REQ_NO_TORCH"
+
 # ----------------------------
-# 2) 清理 wheelhouse 里明显不匹配的 torch（比如 cp38）
+# 2) 清理 wheelhouse 里明显不匹配的 torch（比如 cp38/cp39/cp311）
 # ----------------------------
 echo "[cpu] cleaning mismatched torch wheels (keep cp310)..."
-rm -f "$WHEELHOUSE"/torch-*-cp3[789]*.whl "$WHEELHOUSE"/torchvision-*-cp3[789]*.whl "$WHEELHOUSE"/torchaudio-*-cp3[789]*.whl 2>/dev/null || true
+rm -f "$WHEELHOUSE"/torch-*-cp3[789]*.whl \
+      "$WHEELHOUSE"/torchvision-*-cp3[789]*.whl \
+      "$WHEELHOUSE"/torchaudio-*-cp3[789]*.whl 2>/dev/null || true
+
+# 也顺手清掉 cp311/cp312（避免 GPU 误装）
+rm -f "$WHEELHOUSE"/torch-*-cp31[12]*.whl \
+      "$WHEELHOUSE"/torchvision-*-cp31[12]*.whl \
+      "$WHEELHOUSE"/torchaudio-*-cp31[12]*.whl 2>/dev/null || true
 
 # ----------------------------
 # 3) 下载 pip/setuptools/wheel 自身（GPU 离线 venv 更稳）
 # ----------------------------
 echo "[cpu] downloading bootstrap wheels (pip/setuptools/wheel)..."
-python3 -m pip download -d "$WHEELHOUSE"   -i "$PYPI_URL"   --no-cache-dir --disable-pip-version-check   "pip" "setuptools" "wheel" >/dev/null
+python3 -m pip download -d "$WHEELHOUSE" \
+  -i "$PYPI_URL" \
+  --no-cache-dir --disable-pip-version-check \
+  "pip" "setuptools" "wheel" >/dev/null
 
 # ----------------------------
-# 4) 下载全部依赖 wheels（面向 GPU 的 cp310 manylinux）
-#    强制 PyPI + PyTorch 官方 cu124
+# 4) 先下载 torch/vision/audio（主 index=cu124，extra=PyPI）
 # ----------------------------
-echo "[cpu] downloading all wheels for target: py${TARGET_PY} ${TARGET_PLATFORM} ..."
-python3 -m pip download -r "$REQ" -d "$WHEELHOUSE"   --only-binary=:all:   --platform "$TARGET_PLATFORM"   --python-version "$TARGET_PY"   --abi "$TARGET_ABI"   --implementation "$TARGET_IMPL"   -i "$PYPI_URL"   --extra-index-url "$TORCH_CU124_URL"   --no-cache-dir --disable-pip-version-check
+echo "[cpu] downloading torch stack from cu124 (target cp310)..."
+python3 -m pip download -d "$WHEELHOUSE" \
+  --only-binary=:all: \
+  --platform "$TARGET_PLATFORM" \
+  --python-version "$TARGET_PY" \
+  --abi "$TARGET_ABI" \
+  --implementation "$TARGET_IMPL" \
+  -i "$TORCH_CU124_URL" \
+  --extra-index-url "$PYPI_URL" \
+  --no-cache-dir --disable-pip-version-check \
+  "torch==2.4.1" "torchvision==0.19.1" "torchaudio==2.4.1"
+
+# ----------------------------
+# 5) 下载其余依赖（主 index=PyPI）
+# ----------------------------
+echo "[cpu] downloading other deps from PyPI (target cp310)..."
+python3 -m pip download -r "$REQ_NO_TORCH" -d "$WHEELHOUSE" \
+  --only-binary=:all: \
+  --platform "$TARGET_PLATFORM" \
+  --python-version "$TARGET_PY" \
+  --abi "$TARGET_ABI" \
+  --implementation "$TARGET_IMPL" \
+  -i "$PYPI_URL" \
+  --no-cache-dir --disable-pip-version-check
 
 echo "[cpu] wheelhouse count: $(ls -1 "$WHEELHOUSE" | wc -l)"
+echo "[cpu] torch wheels sanity (should be cp310 + cu124):"
+ls -1 "$WHEELHOUSE" | grep -E '^(torch|torchvision|torchaudio)-' | head -n 20 || true
 
 # ----------------------------
-# 5) 下载 COCO val2017 + annotations（官方 COCO 源）
+# 6) 下载 COCO val2017 + annotations（官方 COCO 源）
 # ----------------------------
 download_if_needed () {
   local url="$1"
@@ -127,7 +169,6 @@ download_if_needed () {
   local name
   name="$(basename "$out")"
   if [ -f "$out" ]; then
-    # zip 就测一下
     if [[ "$out" == *.zip ]]; then
       unzip -t "$out" >/dev/null 2>&1 && { echo "[cpu] coco ok: $name"; return 0; }
       echo "[cpu] coco zip corrupt -> re-download: $name"
@@ -169,7 +210,7 @@ if [ ! -d "$ANN_DIR" ]; then
 fi
 
 # ----------------------------
-# 6) 模型：如果不存在再下载（HF 官方）
+# 7) 模型：如果不存在再下载（HF 官方）
 # ----------------------------
 if [ -f "$MODEL_DIR/config.json" ] || [ -f "$MODEL_DIR/model.safetensors.index.json" ] || ls "$MODEL_DIR"/*.safetensors >/dev/null 2>&1; then
   echo "[cpu] model already present: $MODEL_DIR"
@@ -183,7 +224,6 @@ else
   source "$DL_VENV/bin/activate"
   python -m pip install -U pip -i "$PYPI_URL" --no-cache-dir --disable-pip-version-check >/dev/null
   python -m pip install -U "huggingface_hub>=0.24" "hf_transfer" -i "$PYPI_URL" --no-cache-dir --disable-pip-version-check >/dev/null || true
-
   export HF_HUB_ENABLE_HF_TRANSFER=1
 
   # 如果需要 token：export HF_TOKEN=...
@@ -201,7 +241,6 @@ snapshot_download(
 )
 print("[cpu] downloaded:", repo_id, "->", local_dir)
 PY
-
   deactivate || true
 fi
 
