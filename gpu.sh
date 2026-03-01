@@ -27,6 +27,18 @@ COCO_ANN_PATH="$COCO_ROOT/annotations/instances_val2017.json"
 
 RESULT_DIR="$BASE_DIR/results"
 LOG_DIR="$BASE_DIR/logs"
+
+# --- (default) clean previous artifacts to avoid mixing runs ---
+CLEAN_OLD="${CLEAN_OLD:-1}"
+if [ "$CLEAN_OLD" = "1" ]; then
+  echo "[gpu] cleaning old results/logs under:"
+  echo "  - $RESULT_DIR"
+  echo "  - $LOG_DIR"
+  mkdir -p "$RESULT_DIR" "$LOG_DIR"
+  rm -f "$RESULT_DIR"/p0a_* "$RESULT_DIR"/p0b_* "$RESULT_DIR"/*.tmp 2>/dev/null || true
+  rm -f "$LOG_DIR"/*.log "$LOG_DIR"/*.txt 2>/dev/null || true
+fi
+
 VENV_DIR="$BASE_DIR/venv/p0_env"
 
 echo "================================================================"
@@ -79,7 +91,7 @@ echo "[gpu] upgrading pip/setuptools/wheel from wheelhouse (offline)..."
 python -m pip install --no-index --find-links "$WHEELHOUSE" -U pip setuptools wheel
 
 echo "[gpu] installing torch (offline)..."
-python -m pip install --no-index --find-links "$WHEELHOUSE" "torch==2.4.1+cu124"
+python -m pip install --no-index --find-links "$WHEELHOUSE" "torch==2.4.1" "torchvision==0.19.1" "torchaudio==2.4.1"
 
 echo "[gpu] installing other deps (offline)..."
 python -m pip install --no-index --find-links "$WHEELHOUSE" -r "$CODE_DIR/requirements.notorch.txt"

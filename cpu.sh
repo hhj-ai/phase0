@@ -31,7 +31,7 @@ TORCH_INDEX="https://download.pytorch.org/whl/cu124"
 DL_FLAGS=(
   --only-binary=:all:
   --platform manylinux2014_x86_64
-  --python-version 3.10
+  --python-version 310
   --implementation cp
   --abi cp310
   --abi abi3
@@ -91,11 +91,11 @@ EOF
 
 # Lock file includes torch
 cat > "$REQ_LOCK" <<'EOF'
-torch==2.4.1+cu124
+torch==2.4.1
 # (optional) torchvision/torchaudio are not required for this P0,
 # but can be useful. Uncomment if you want them in the wheelhouse.
-# torchvision==0.19.1+cu124
-# torchaudio==2.4.1+cu124
+# torchvision==0.19.1
+# torchaudio==2.4.1
 
 # Mirror the rest:
 transformers==5.2.0
@@ -148,7 +148,7 @@ echo "[cpu] downloading torch wheels (cu124) into wheelhouse..."
   "${DL_FLAGS[@]}" \
   --index-url "$TORCH_INDEX" \
   --extra-index-url "$PIP_PYPI" \
-  "torch==2.4.1+cu124"
+  "torch==2.4.1" "torchvision==0.19.1" "torchaudio==2.4.1"
 
 # Everything else from PyPI (py310 wheels)
 echo "[cpu] downloading remaining wheels into wheelhouse..."
