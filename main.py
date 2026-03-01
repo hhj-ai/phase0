@@ -684,66 +684,99 @@ def run_probe(args: argparse.Namespace, paths: Paths) -> None:
     print(f"[saved] {out_path}")
 
 def run_worker(args: argparse.Namespace, paths: Paths) -> None:
-    if args.shard_idx is not None and args.num_shards is not None:
+    # ------------------------------------------------------------
+    # Sharding
+    # ------------------------------------------------------------
+    if args.shard_idx is not None:
         shard_idx = int(args.shard_idx)
         num_shards = int(args.num_shards)
     else:
         shard_idx = int(os.environ.get("RANK", "0"))
         num_shards = int(os.environ.get("WORLD_SIZE", "1"))
 
-    # IMPORTANT: under torchrun, each process must bind to its own GPU.
-    # Prefer LOCAL_RANK if present; fall back to --device only in non-torchrun runs.
-# Detect per-process local rank (torchrun / slurm / mpi). If missing, fall back to global rank modulo #GPUs.
-local_rank_env = (
-    os.environ.get("LOCAL_RANK")
-    or os.environ.get("SLURM_LOCALID")
-    or os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
-    or os.environ.get("MPI_LOCALRANKID")
-)
-global_rank_env = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or os.environ.get("OMPI_COMM_WORLD_RANK")
+    # ------------------------------------------------------------
+    # Device binding (critical under torchrun)
+    # ------------------------------------------------------------
+    local_rank_env = (
+        os.environ.get("LOCAL_RANK")
+        or os.environ.get("SLURM_LOCALID")
+        or os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
+        or os.environ.get("MPI_LOCALRANKID")
+    )
+    global_rank_env = (
+        os.environ.get("RANK")
+        or os.environ.get("SLURM_PROCID")
+        or os.environ.get("OMPI_COMM_WORLD_RANK")
+        or os.environ.get("PMI_RANK")
+    )
 
-if local_rank_env is not None:
-    device_id = int(local_rank_env)
-elif global_rank_env is not None and torch.cuda.is_available():
-    device_id = int(global_rank_env) % torch.cuda.device_count()
-else:
-    device_id = int(args.device) if args.device is not None else 0
+    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        n_gpu = torch.cuda.device_count()
+        if local_rank_env is not None:
+            device_id = int(local_rank_env)
+        elif global_rank_env is not None:
+            device_id = int(global_rank_env) % n_gpu
+        else:
+            device_id = 0
+        torch.cuda.set_device(device_id)
+        device = torch.device(f"cuda:{device_id}")
 
-if torch.cuda.is_available():
-    torch.cuda.set_device(device_id)
-device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
-print(f"[worker] shard={shard_idx}/{num_shards} local_rank={local_rank_env} rank={global_rank_env} device={device} visible={os.environ.get('CUDA_VISIBLE_DEVICES','')}")
+    print(
+        f"[worker] shard={shard_idx}/{num_shards} "
+        f"local_rank={local_rank_env} rank={global_rank_env} "
+        f"device={device} n_gpu={torch.cuda.device_count() if torch.cuda.is_available() else 0} "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+    )
 
     ensure_dir(paths.result_dir)
+
+    # ------------------------------------------------------------
+    # Load model + hook (each process loads on its own GPU)
+    # ------------------------------------------------------------
     model, processor = load_model_and_processor(paths.model_path, device)
     spatial_merge_size = _infer_merge_size(model)
 
     hook = VisualHook()
     hook.register(model.model.visual)
 
-    samples = load_samples(paths.coco_ann_path, paths.coco_img_dir, n_samples=args.num_samples, seed=args.seed)
-    shard_samples = samples[shard_idx::num_shards]
-    print(f"[worker] shard_samples={len(shard_samples)}")
-
-    rows = []
-    for s in shard_samples:
-        r = run_one_sample(
-            s, model, processor, hook, device,
-            t_key_size=args.t_key_size,
-            lambda_e_values=args.lambda_e_values,
-            replace_mode=args.replace_mode,
-            noise_scale=args.noise_scale,
-            seed_base=int(args.seed),
-            spatial_merge_size=spatial_merge_size,
+    try:
+        # ------------------------------------------------------------
+        # Load samples and take this shard's slice
+        # ------------------------------------------------------------
+        samples = load_samples(
+            coco_img_dir=paths.coco_img_dir,
+            coco_ann_path=paths.coco_ann_path,
+            n_total=args.num_samples,
+            seed=args.seed,
         )
-        if r is not None:
-            rows.append(r)
+        shard_samples = samples[shard_idx::num_shards]
+        print(f"[worker] shard_samples={len(shard_samples)}")
 
-    hook.close()
+        rows = []
+        for ex in shard_samples:
+            row = run_one_sample(
+                ex=ex,
+                model=model,
+                processor=processor,
+                device=device,
+                hook=hook,
+                spatial_merge_size=spatial_merge_size,
+                layers=args.layers,
+                lambda_e_values=args.lambda_e_values,
+                replace_mode=args.replace_mode,
+                noise_scale=args.noise_scale,
+                t_key_size=args.t_key_size,
+            )
+            rows.append(row)
 
-    out_csv = os.path.join(paths.result_dir, f"p0b_shard_{shard_idx:03d}_of_{num_shards:03d}.csv")
-    pd.DataFrame(rows).to_csv(out_csv, index=False)
-    print(f"[saved] {out_csv} rows={len(rows)}")
+        out_csv = os.path.join(
+            paths.result_dir, f"p0b_shard_{shard_idx:03d}_of_{num_shards:03d}.csv"
+        )
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+        print(f"[saved] {out_csv} rows={len(rows)}")
+    finally:
+        hook.remove()
 
 def run_analyze(args: argparse.Namespace, paths: Paths) -> None:
     import pandas as pd
