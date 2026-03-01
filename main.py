@@ -691,9 +691,17 @@ def run_worker(args: argparse.Namespace, paths: Paths) -> None:
         shard_idx = int(os.environ.get("RANK", "0"))
         num_shards = int(os.environ.get("WORLD_SIZE", "1"))
 
-    device_id = args.device if args.device is not None else int(os.environ.get("LOCAL_RANK", "0"))
+    # IMPORTANT: under torchrun, each process must bind to its own GPU.
+    # Prefer LOCAL_RANK if present; fall back to --device only in non-torchrun runs.
+    local_rank_env = os.environ.get("LOCAL_RANK")
+    if local_rank_env is not None:
+        device_id = int(local_rank_env)
+    else:
+        device_id = int(args.device) if args.device is not None else 0
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device_id)
     device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
-    print(f"[worker] shard={shard_idx}/{num_shards} device={device}")
+    print(f"[worker] shard={shard_idx}/{num_shards} local_rank={local_rank_env} device={device}")
 
     ensure_dir(paths.result_dir)
     model, processor = load_model_and_processor(paths.model_path, device)
@@ -859,19 +867,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = p.add_subparsers(dest="cmd", required=True)
 
-    def add_run_args(pp: argparse.ArgumentParser):
+    def add_run_args(pp: argparse.ArgumentParser, device_default=None):
         pp.add_argument("--seed", type=int, default=42)
-        pp.add_argument("--device", type=int, default=0)
+        pp.add_argument("--device", type=int, default=device_default)
         pp.add_argument("--t_key_size", type=int, default=4)
         pp.add_argument("--lambda_e_values", type=float, nargs="+", default=[0.0, 0.05, 0.10, 0.20, 0.50])
         pp.add_argument("--replace_mode", type=str, default="moment_noise", choices=["moment_noise", "mean", "patch_swap"])
         pp.add_argument("--noise_scale", type=float, default=0.15)
 
     p_probe = sp.add_parser("probe", help="P0-a probe + sanity replacement")
-    add_run_args(p_probe)
+    add_run_args(p_probe, device_default=0)
 
     p_worker = sp.add_parser("worker", help="P0-b worker shard")
-    add_run_args(p_worker)
+    add_run_args(p_worker, device_default=None)
     p_worker.add_argument("--shard_idx", type=int, default=None)
     p_worker.add_argument("--num_shards", type=int, default=None)
     p_worker.add_argument("--num_samples", type=int, default=400)
