@@ -4,7 +4,8 @@
 main.py — P0 pipeline (probe/worker/analyze/summary) for Qwen3-VL visual-feature counterfactuals.
 
 Key points:
-  - Paths configurable via CLI; base_dir defaults to /mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl (override via env P0_BASE_DIR).
+  - Paths configurable via CLI; base_dir defaults to the directory that contains this file
+    (override via --base_dir or env P0_BASE_DIR).
   - Control-region metrics (ctrl_*) computed for ALL samples (not cp-only).
   - Worker sharding can be explicit (--shard_idx/--num_shards) so you don't need torchrun.
 
@@ -21,6 +22,7 @@ import random
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -502,8 +504,7 @@ def run_one_sample(
     grid_w = int(grid_thw[0, 2].item())
 
     # original forward
-    hook.reset(),
-    layers: 'Optional[List[int]]' = None,
+    hook.reset()
     with torch.no_grad():
         orig_out = model(**inputs, output_hidden_states=False, return_dict=True)
     if hook.captured is None:
@@ -966,7 +967,7 @@ def run_summary(_args: argparse.Namespace, paths: Paths) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
-    p.add_argument("--base_dir", type=str, default=os.environ.get("P0_BASE_DIR", "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/data/p0_qwen3vl"),
+    p.add_argument("--base_dir", type=str, default=os.environ.get("P0_BASE_DIR", str(Path(__file__).resolve().parent)),
                    help="shared base dir (override via env P0_BASE_DIR)")
     p.add_argument("--model_path", type=str, default=os.environ.get("P0_MODEL_PATH", ""), help="local model dir")
     p.add_argument("--coco_img_dir", type=str, default=os.environ.get("P0_COCO_IMG_DIR", ""), help="COCO val2017 image dir")
@@ -983,6 +984,8 @@ def build_parser() -> argparse.ArgumentParser:
         pp.add_argument("--lambda_e_values", type=float, nargs="+", default=[0.0, 0.05, 0.10, 0.20, 0.50])
         pp.add_argument("--replace_mode", type=str, default="moment_noise", choices=["moment_noise", "mean", "patch_swap"])
         pp.add_argument("--noise_scale", type=float, default=0.15)
+        pp.add_argument("--layers", nargs="+", type=int, default=[16, 20, 24, 28, 32],
+                        help="Which layers to hook/perturb (space-separated ints).")
 
     p_probe = sp.add_parser("probe", help="P0-a probe + sanity replacement")
     add_run_args(p_probe, device_default=0)

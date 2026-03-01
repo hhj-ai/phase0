@@ -1,20 +1,3 @@
-# Core
-numpy==2.0.1
-pillow==10.4.0
-opencv-python-headless==4.10.0.84
-ujson==5.10.0
-tqdm==4.66.5
-
-# HF stack
-transformers==5.2.0
-huggingface_hub==1.5.0
-tokenizers==0.22.2
-safetensors==0.5.2
-accelerate==1.10.1
-
-# Qwen-VL utils
-qwen-vl-utils==0.0.13
-einops==0.8.2
-
-# Compatibility guard (datasets 3.2.0 requires fsspec[http]<=2024.9.0)
-fsspec[http]==2024.9.0
+# "Lock" kept intentionally loose for cluster compatibility.
+# If you need strict reproducibility, pin versions after confirming what's available in your pip index.
+-r requirements.notorch.txt
